@@ -5,46 +5,67 @@ accounts by hot-swapping `~/.claude/.credentials.json` on a systemd user timer,
 so unattended background work keeps running against whichever account has budget.
 
 Claude Code re-reads `.credentials.json` on nearly every API call, so atomically
-replacing the whole file redirects even already-running jobs within seconds. With
-one account this is a monitored no-op; it starts rotating the moment a second
-account is bootstrapped. See `SPEC.md` for the full behavior and acceptance
-criteria.
+rewriting the account token in that file redirects even already-running jobs
+within seconds. With one account this is a monitored no-op; it starts rotating
+the moment a second account is bootstrapped. See `SPEC.md` for the full behavior
+and acceptance criteria.
 
 ## How it works
 
-Each account's complete credential file (account token plus per-MCP tokens) is
-copied into a store outside the repo. A pointer file tracks which account is
-currently live. On each timer tick `rotate.sh`:
+Only the Claude account token (`.claudeAiOauth`) is swapped. The third-party MCP
+tokens (`.mcpOAuth`) are account-independent, so they live permanently in the live
+credentials file and rotation never touches them: a swap is a read-modify-write
+that replaces only `.claudeAiOauth` and preserves the live `.mcpOAuth`. Each
+account's token is stored token-only, and one shared canonical MCP set is stored
+once.
 
-1. Syncs the live credential file back into the active account's stored copy,
-   capturing any token refresh (never overwriting the store from a partial file).
+A pointer file tracks which account is currently live. On each timer tick
+`rotate.sh`:
+
+1. Syncs the live account token back into the active account's stored copy,
+   capturing any token refresh (never overwriting the store from a partial file),
+   and refreshes the shared MCP set from the live file.
 2. Polls the Anthropic OAuth usage endpoint for every account.
-3. Decides whether to swap, and if so atomically copies the target account's
-   stored file over the live credential file and updates the pointer.
+3. Decides whether to swap, and if so swaps in the target account's stored token
+   over the live credential file (preserving the live MCP tokens) and updates the
+   pointer.
 
 The store lives at `$ROTATOR_STORE` (default `~/.claude/accounts`, dir 0700):
 
-- `<label>.json`       full copy of that account's `.credentials.json` (0600)
+- `<label>.json`       token-only copy: that account's `.claudeAiOauth`, no MCP tokens (0600)
+- `mcp.json`           the shared canonical MCP set (`.mcpOAuth`, 0600)
 - `<label>.usage.json` last-known usage snapshot
 - `active`             label currently occupying the live credential file
 - `ENABLED`            sentinel; rotate is a no-op unless this exists
 - `rotate.log`         append-only, ISO-8601 timestamps
 
-The store must live OUTSIDE the repo (default `~/.claude/accounts`) so the full
-credential copies it holds are never committable. The real `config.env` also
+The store must live OUTSIDE the repo (default `~/.claude/accounts`) so the
+credential material it holds is never committable. The real `config.env` also
 lives outside version control (gitignored).
 
 ## Bootstrap flow
 
-Do this once per account. For each account:
+MCP tokens are account-independent, so you authenticate your MCP servers ONCE, on
+your first account, and every other account reuses that shared set.
 
-1. In `claude`, `/login` to the account you want to capture.
-2. Re-authenticate EVERY MCP server on that account so its credential file is
-   complete.
-3. Run `./bootstrap.sh <label>` (labels are alphanumeric/dash only). This copies
-   the live credential file into the store, best-effort captures its usage, and
-   sets the `active` pointer to `<label>` (the account you just captured).
-4. Repeat 1-3 for each account.
+First account (the one that will hold your MCP servers):
+
+1. In `claude`, `/login` to that account.
+2. Re-authenticate EVERY MCP server on it so its credential file is complete.
+3. Run `./bootstrap.sh <label>` (labels are alphanumeric/dash only). This captures
+   the account token (token-only) into the store, captures the shared MCP set once
+   into `mcp.json`, best-effort captures usage, and sets the `active` pointer.
+
+Each additional account:
+
+4. In `claude`, `/login` to the next account. In practice the MCP tokens usually
+   persist across a `/login`, but a login MAY clear them.
+5. Run `./bootstrap.sh <next-label>`. If the login cleared the live MCP set,
+   bootstrap restores the shared set from `mcp.json` into the live credentials; if
+   the MCP tokens survived, bootstrap just refreshes the shared set. Either way the
+   account regains MCP access. Only claude.ai connectors need a per-account
+   reconnect in the UI.
+6. Repeat 4-5 for each account.
 
 Each bootstrap sets `active` to the account it just captured, so the LAST
 account you bootstrap is the active one when you go live. That is fine: rotation
@@ -129,7 +150,7 @@ tick cannot copy the new live cred over the old active account's stored file:
 
 ```
 rm "$ROTATOR_STORE/ENABLED"       # pause rotation
-# ...now /login to the other account and re-auth its MCPs...
+# ...now /login to the other account (bootstrap restores its shared MCP set)...
 ./bootstrap.sh <label>            # recapture + realign the pointer
 touch "$ROTATOR_STORE/ENABLED"    # resume rotation
 ```

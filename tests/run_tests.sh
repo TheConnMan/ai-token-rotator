@@ -56,6 +56,39 @@ EOF
     chmod 600 "$path"
 }
 
+# make_token_store <path> <token> - write a TOKEN-ONLY store file (the new
+# <label>.json format): only .claudeAiOauth, NO .mcpOAuth. Used to seed the
+# store account files, which no longer carry MCP tokens under the token-only swap.
+make_token_store() {
+    local path="$1" token="$2"
+    cat > "$path" <<EOF
+{"claudeAiOauth":{"accessToken":"$token","refreshToken":"rt-$token","expiresAt":9999999999999}}
+EOF
+    chmod 600 "$path"
+}
+
+# make_mcp_store <path> <marker> - write a canonical mcp.json (or a fixture to
+# assert restore/preserve against). Holds only .mcpOAuth, keyed "srv", whose
+# accessToken is <marker> so we can prove which MCP set landed where.
+make_mcp_store() {
+    local path="$1" marker="$2"
+    cat > "$path" <<EOF
+{"mcpOAuth":{"srv":{"accessToken":"$marker","serverUrl":"https://x"}}}
+EOF
+    chmod 600 "$path"
+}
+
+# make_mcp_store_pair <path> <tokA> <tokB> - write a canonical mcp.json holding
+# TWO servers (srvA, srvB) so a grow-merge test can prove srvB survives when the
+# live set only refreshes srvA.
+make_mcp_store_pair() {
+    local path="$1" toka="$2" tokb="$3"
+    cat > "$path" <<EOF
+{"mcpOAuth":{"srvA":{"accessToken":"$toka"},"srvB":{"accessToken":"$tokb"}}}
+EOF
+    chmod 600 "$path"
+}
+
 # make_usage <path> <five_h> <weekly> - write a store usage.json sidecar.
 make_usage() {
     local path="$1" five="$2" weekly="$3"
@@ -97,7 +130,8 @@ setup_sandbox() {
     chmod 700 "$STORE"
 }
 
-seed_account() { make_cred "$STORE/$1.json" "$2"; }
+# Store account files are TOKEN-ONLY now (no .mcpOAuth), so seed with make_token_store.
+seed_account() { make_token_store "$STORE/$1.json" "$2"; }
 set_active()   { printf '%s' "$1" > "$STORE/active"; }
 enable()       { : > "$STORE/ENABLED"; }
 
@@ -170,6 +204,21 @@ assert_cred_token() {
     fi
     act=$(jq -r '.claudeAiOauth.accessToken' "$path")
     assert_eq "$exp" "$act" "$msg accessToken"
+}
+
+# assert_mcp_token <path> <key> <token> <msg> - file has .mcpOAuth.<key>.accessToken == <token>.
+assert_mcp_token() {
+    local path="$1" key="$2" exp="$3" msg="$4" act
+    act=$(jq -r --arg k "$key" '.mcpOAuth[$k].accessToken // empty' "$path" 2>/dev/null)
+    assert_eq "$exp" "$act" "$msg"
+}
+
+# assert_no_mcp <path> <msg> - file is token-only: it has NO .mcpOAuth key at all.
+assert_no_mcp() {
+    local path="$1" msg="$2"
+    if jq -e 'has("mcpOAuth")' "$path" >/dev/null 2>&1; then
+        fail "$msg (unexpected .mcpOAuth present in '$path')"
+    fi
 }
 
 active_label() { cat "$STORE/active" 2>/dev/null; }
@@ -310,13 +359,15 @@ scenario_sync_out_before_swap() {
     make_mock "$MOCK" "tok-acctA-new" 90 10  # active uses LIVE token; A fires
     make_mock "$MOCK" "tok-acctB" 20 10
 
-    local cred_ref="$SB/cred_ref.json"
-    cp "$CRED" "$cred_ref"               # snapshot the pre-tick live cred
+    # Snapshot the pre-tick live account token; sync-out is token-only now, so we
+    # assert the OLD active's <label>.json captured THAT token (not a whole-file sha).
+    local live_tok_before
+    live_tok_before=$(jq -r '.claudeAiOauth.accessToken' "$CRED")
 
     run_rotate
     assert_exit 0 "$RC" "sync-out exits 0"
-    # OLD active's stored file must now equal the refreshed live cred captured before swap.
-    assert_file_eq "$STORE/acctA.json" "$cred_ref" "sync-out captured refresh into acctA.json"
+    # OLD active's stored file must now carry the refreshed live account token.
+    assert_cred_token "$STORE/acctA.json" "$live_tok_before" "sync-out captured refresh token into acctA.json"
     assert_eq "acctB" "$(active_label)" "sync-out then swapped to acctB"
     assert_cred_token "$CRED" "tok-acctB" "sync-out live cred now acctB"
 }
@@ -368,21 +419,29 @@ scenario_target_invalid_no_swap() {
     assert_cred_token "$CRED" "tok-acctA" "target-invalid live cred unchanged"
 }
 
-# After a swap the live cred is valid JSON equal to the target's stored file.
-scenario_swap_leaves_valid_target_content() {
+# TOKEN-ONLY swap: a swap replaces only the live .claudeAiOauth from the target's
+# store file and PRESERVES the live .mcpOAuth. This is the core proof of the new
+# mechanism: the swapped-in account token is the target's, but the third-party MCP
+# tokens are the ones that were live (acctA's), NOT the target's.
+scenario_swap_token_only_preserves_mcp() {
     make_config "$CONFIG" "acctA acctB"
-    seed_account acctA "tok-acctA"
-    seed_account acctB "tok-acctB"
+    # Store account files are token-only (no mcpOAuth).
+    make_token_store "$STORE/acctA.json" "tok-acctA"
+    make_token_store "$STORE/acctB.json" "tok-acctB"
     set_active acctA
     enable
-    make_cred "$CRED" "tok-acctA"
-    make_mock "$MOCK" "tok-acctA" 90 10   # A fires
+    make_cred "$CRED" "tok-acctA"         # live cred carries mcpOAuth "mcp-tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 10    # A fires
     make_mock "$MOCK" "tok-acctB" 20 10
 
     run_rotate
-    assert_exit 0 "$RC" "atomic-swap exits 0"
-    assert_cred_token "$CRED" "tok-acctB" "atomic-swap cred valid + is target token"
-    assert_file_eq "$CRED" "$STORE/acctB.json" "atomic-swap cred equals target store file"
+    assert_exit 0 "$RC" "token-only-swap exits 0"
+    # (a) live account token is the target's.
+    assert_cred_token "$CRED" "tok-acctB" "token-only-swap live account token is acctB"
+    # (b) live MCP token is PRESERVED from the live file (acctA's), not taken from acctB.
+    assert_mcp_token "$CRED" "server-x" "mcp-tok-acctA" \
+        "token-only-swap preserved live mcpOAuth across swap"
+    # (c) live cred is still valid JSON with an accessToken (assert_cred_token proved this).
 }
 
 # status mode mutates NOTHING and exits 0, even when a swap would otherwise fire.
@@ -484,6 +543,48 @@ scenario_bootstrap_sets_active_to_captured() {
     assert_eq "acctB" "$(active_label)" "bootstrap-active realigned pointer to acctB"
 }
 
+# bootstrap captures a TOKEN-ONLY <label>.json AND updates the canonical mcp.json
+# from the live cred's mcpOAuth ("copy everything once").
+scenario_bootstrap_token_only_and_canonical_mcp() {
+    make_cred "$CRED" "tok-acctA"          # live cred has mcpOAuth "mcp-tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 10    # best-effort usage fetch succeeds
+
+    run_bootstrap acctA
+    assert_exit 0 "$RC" "bootstrap-canonical exits 0"
+    # <label>.json is token-only: has the account token, no mcpOAuth.
+    assert_cred_token "$STORE/acctA.json" "tok-acctA" "bootstrap-canonical acctA.json token"
+    assert_no_mcp "$STORE/acctA.json" "bootstrap-canonical acctA.json is token-only"
+    # canonical mcp.json captured the live MCP set.
+    if [ ! -f "$STORE/mcp.json" ]; then
+        fail "bootstrap-canonical did not create mcp.json"
+    fi
+    assert_mcp_token "$STORE/mcp.json" "server-x" "mcp-tok-acctA" \
+        "bootstrap-canonical mcp.json captured live MCP token"
+    assert_eq "acctA" "$(active_label)" "bootstrap-canonical set active to acctA"
+}
+
+# bootstrap RESTORES the canonical MCP set into the LIVE cred when the live
+# .mcpOAuth is empty (simulating a post-/login wipe) and $STORE/mcp.json exists.
+scenario_bootstrap_restores_mcp_after_login_wipe() {
+    make_mcp_store "$STORE/mcp.json" "canon-mcp-XYZ"   # pre-existing canonical set
+    # Live cred: valid account token but EMPTY mcpOAuth (the /login wipe).
+    cat > "$CRED" <<'EOF'
+{"claudeAiOauth":{"accessToken":"tok-acctB","refreshToken":"rt","expiresAt":9999999999999},"mcpOAuth":{}}
+EOF
+    chmod 600 "$CRED"
+    make_mock "$MOCK" "tok-acctB" 10 10
+
+    run_bootstrap acctB
+    assert_exit 0 "$RC" "bootstrap-restore exits 0"
+    # The canonical MCP set was restored INTO the live cred file.
+    assert_mcp_token "$CRED" "srv" "canon-mcp-XYZ" \
+        "bootstrap-restore put canonical MCP set into live cred"
+    # <label>.json is still token-only with the live account token.
+    assert_cred_token "$STORE/acctB.json" "tok-acctB" "bootstrap-restore acctB.json token"
+    assert_no_mcp "$STORE/acctB.json" "bootstrap-restore acctB.json is token-only"
+    assert_eq "acctB" "$(active_label)" "bootstrap-restore set active to acctB"
+}
+
 # Swap COPY failure must hold the pointer + live cred unchanged (no torn swap).
 # Forces the failure by making the live cred's parent dir read-only so the
 # atomic_replace mktemp cannot create its temp file.
@@ -504,6 +605,40 @@ scenario_swap_failure_holds_pointer() {
     assert_exit 0 "$RC" "swap-fail exits 0"
     assert_eq "acctA" "$(active_label)" "swap-fail active pointer unchanged"
     assert_cred_token "$CRED" "tok-acctA" "swap-fail live cred unchanged"
+}
+
+# sync-out MCP capture must GROW-merge the canonical mcp.json, never shrink it.
+# The canonical set has TWO servers; the live set is a strict SUBSET (only srvA,
+# with a refreshed token). After a HOLD tick's sync-out, srvA must be refreshed to
+# the live token AND srvB must be PRESERVED (not deleted). This fails against the
+# old wholesale-overwrite capture_mcp and passes after the grow-merge fix.
+scenario_synced_capture_mcp_grows_not_shrinks() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    # Canonical store already holds two servers.
+    make_mcp_store_pair "$STORE/mcp.json" "canonA" "canonB"
+    # Live cred: valid account token, but its .mcpOAuth is only srvA (refreshed).
+    cat > "$CRED" <<'EOF'
+{"claudeAiOauth":{"accessToken":"tok-acctA","refreshToken":"rt","expiresAt":9999999999999},"mcpOAuth":{"srvA":{"accessToken":"liveA"}}}
+EOF
+    chmod 600 "$CRED"
+    # Equal usage across both accounts => decision=HOLD (no swap), but sync-out
+    # still runs before the decision, exercising capture_mcp.
+    make_mock "$MOCK" "tok-acctA" 10 10
+    make_mock "$MOCK" "tok-acctB" 10 10
+
+    run_rotate
+    assert_exit 0 "$RC" "grow-merge exits 0"
+    assert_eq "acctA" "$(active_label)" "grow-merge held on acctA (no swap)"
+    # srvA refreshed to the live token.
+    assert_mcp_token "$STORE/mcp.json" "srvA" "liveA" \
+        "grow-merge refreshed srvA from the live set"
+    # srvB PRESERVED from canonical (would be deleted by wholesale overwrite).
+    assert_mcp_token "$STORE/mcp.json" "srvB" "canonB" \
+        "grow-merge preserved canonical-only srvB"
 }
 
 # ============================================================================
@@ -537,13 +672,16 @@ run_scenario "Both triggers => A target wins"                  scenario_both_tri
 run_scenario "sync-out captures refresh before swap"           scenario_sync_out_before_swap
 run_scenario "Invalid live cred => skip, store untouched"      scenario_invalid_live_cred_skips
 run_scenario "Target missing/invalid => no swap"               scenario_target_invalid_no_swap
-run_scenario "Swap leaves cred valid + target content"         scenario_swap_leaves_valid_target_content
+run_scenario "Token-only swap preserves live mcpOAuth"         scenario_swap_token_only_preserves_mcp
 run_scenario "status mode mutates nothing"                     scenario_status_mutates_nothing
 run_scenario "Fallback uses stored usage when token 401s"      scenario_fallback_uses_stored_usage
 run_scenario "N=1 polls and logs (writes usage), never swaps"  scenario_n1_polls_and_logs
 run_scenario "Desync guard: no clobber of active store slot"   scenario_desync_guard_no_clobber
 run_scenario "Bootstrap sets active to captured account"       scenario_bootstrap_sets_active_to_captured
+run_scenario "Bootstrap token-only store + canonical mcp.json" scenario_bootstrap_token_only_and_canonical_mcp
+run_scenario "Bootstrap restores MCP after /login wipe"        scenario_bootstrap_restores_mcp_after_login_wipe
 run_scenario "Swap copy failure holds pointer + live cred"     scenario_swap_failure_holds_pointer
+run_scenario "sync-out capture_mcp grows, never shrinks"       scenario_synced_capture_mcp_grows_not_shrinks
 
 printf '\n----------------------------------------\n'
 printf 'Summary: %d passed, %d failed\n' "$PASS" "$FAILED"

@@ -82,9 +82,16 @@ if [ "$DRY" -eq 0 ]; then
                 exit 0
             fi
         done
-        if ! atomic_replace "$CRED" "$STORE/$ACTIVE.json"; then
+        # Token-only sync-out: capture just the account token into ACTIVE's slot
+        # (MCP tokens live permanently in the live file and are never moved).
+        if ! capture_token "$CRED" "$STORE/$ACTIVE.json"; then
             log "sync-out failed, skipping tick to avoid swapping on stale state"
             exit 0
+        fi
+        # Also refresh the canonical shared MCP set from the live file. No-op if
+        # the live MCP set is empty; a failure here is non-fatal.
+        if ! capture_mcp "$CRED" "$STORE/mcp.json"; then
+            log "sync-out: failed to refresh canonical mcp.json (continuing)"
         fi
     else
         log "live cred unreadable, skipping tick"
@@ -219,7 +226,10 @@ fi
 log "$line"
 
 if [ "$SHOULD_SWAP" -eq 1 ]; then
-    if atomic_replace "$STORE/$target.json" "$CRED"; then
+    # Token-only swap: replace only the live .claudeAiOauth from the target's
+    # store file, preserving the live .mcpOAuth. Aborts (no write) if the result
+    # would be invalid, so the live cred is never torn or invalid.
+    if swap_in_token "$STORE/$target.json" "$CRED"; then
         write_active "$target"
         log "SWAP $ACTIVE -> $target: $reason (usages:$usages)"
     else

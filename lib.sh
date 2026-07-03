@@ -116,6 +116,135 @@ valid_cred() {
     jq -e '.claudeAiOauth.accessToken' "$path" >/dev/null 2>&1
 }
 
+# capture_token <cred> <dst> - atomically write a TOKEN-ONLY store file:
+# {"claudeAiOauth": (<cred>.claudeAiOauth)}. Temp in dst's dir + chmod 600 +
+# mv -f. Returns non-zero and cleans up on failure. This is the store write for
+# <label>.json under the token-only swap (MCP tokens are never stored here).
+capture_token() {
+    local cred="$1" dst="$2"
+    local dir tmp
+    dir=$(dirname "$dst")
+    tmp=$(mktemp "$dir/.tokrot.XXXXXX") || return 1
+    if ! jq '{claudeAiOauth: .claudeAiOauth}' "$cred" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 600 "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$dst"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# mcp_is_empty <cred> - return 0 (true) iff <cred> has no .mcpOAuth or it is an
+# empty object. Used to decide whether there is any MCP set to capture/restore.
+mcp_is_empty() {
+    local cred="$1"
+    jq -e '((.mcpOAuth // {}) | length) == 0' "$cred" >/dev/null 2>&1
+}
+
+# capture_mcp <cred> <dst> - GROW-merge the live .mcpOAuth INTO the canonical
+# shared mcp.json at <dst>, never shrinking it. If the live .mcpOAuth is
+# empty/absent, do nothing and return 0 (never write from an empty live set).
+# If <dst> exists, write {"mcpOAuth": (dst.mcpOAuth * cred.mcpOAuth)} so live
+# refreshes overlapping server tokens while canonical-only servers are PRESERVED;
+# if <dst> is absent, write {"mcpOAuth": (cred.mcpOAuth)} (first capture). This is
+# grow-only by design: removing a canonical server requires a manual reset (delete
+# mcp.json and re-bootstrap). Atomic: temp in dst's dir + chmod 600 + mv -f.
+capture_mcp() {
+    local cred="$1" dst="$2"
+    mcp_is_empty "$cred" && return 0
+    local dir tmp
+    dir=$(dirname "$dst")
+    tmp=$(mktemp "$dir/.tokrot.XXXXXX") || return 1
+    if [ -f "$dst" ]; then
+        if ! jq -n --slurpfile d "$dst" --slurpfile c "$cred" \
+            '{mcpOAuth: (($d[0].mcpOAuth // {}) * ($c[0].mcpOAuth // {}))}' \
+            > "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            return 1
+        fi
+    elif ! jq '{mcpOAuth: .mcpOAuth}' "$cred" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 600 "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$dst"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# NOTE: this uses a stored-wins merge (stored overwrites overlapping live keys),
+# which is only safe because its sole caller (bootstrap.sh) invokes it exclusively
+# when the live .mcpOAuth is empty; a future caller with a non-empty live set could
+# discard a fresher live token.
+# restore_mcp <mcp_store_file> <cred> - deep-merge the stored .mcpOAuth INTO the
+# live cred, preserving any live entries: .mcpOAuth = (live.mcpOAuth * stored).
+# Write atomically over <cred>. ABORT (return 1, leave <cred> untouched) if the
+# result is not valid JSON with .claudeAiOauth.accessToken.
+restore_mcp() {
+    local mcp_store="$1" cred="$2"
+    local dir tmp
+    dir=$(dirname "$cred")
+    tmp=$(mktemp "$dir/.tokrot.XXXXXX") || return 1
+    if ! jq --slurpfile m "$mcp_store" \
+        '.mcpOAuth = ((.mcpOAuth // {}) * ($m[0].mcpOAuth // {}))' \
+        "$cred" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! jq -e '.claudeAiOauth.accessToken' "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 600 "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$cred"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# swap_in_token <target_store_file> <cred> - atomically set the live cred's
+# .claudeAiOauth from the target store file, preserving ALL other live fields
+# (including .mcpOAuth). Reads the LIVE cred at swap time, builds a temp in the
+# cred's dir, chmods 600, and VALIDATES the temp has .claudeAiOauth.accessToken
+# before mv -f. ABORT (return 1, remove temp, leave <cred> untouched) if jq fails
+# or the temp is invalid, so the live file is never torn and never invalid.
+swap_in_token() {
+    local target="$1" cred="$2"
+    local dir tmp
+    dir=$(dirname "$cred")
+    tmp=$(mktemp "$dir/.tokrot.XXXXXX") || return 1
+    if ! jq --slurpfile t "$target" \
+        '.claudeAiOauth = $t[0].claudeAiOauth' \
+        "$cred" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! jq -e '.claudeAiOauth.accessToken' "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 600 "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$cred"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
 # num_ge <a> <b> - return 0 if a >= b (fractional-safe via awk).
 num_ge() {
     awk -v a="$1" -v b="$2" 'BEGIN { exit (a >= b) ? 0 : 1 }'

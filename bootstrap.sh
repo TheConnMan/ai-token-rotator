@@ -31,11 +31,35 @@ if ! valid_cred "$CRED"; then
     exit 1
 fi
 
-if ! atomic_replace "$CRED" "$STORE/$label.json"; then
+if ! capture_token "$CRED" "$STORE/$label.json"; then
     echo "error: failed to capture live cred into $STORE/$label.json" >&2
     exit 1
 fi
-echo "captured account '$label' -> $STORE/$label.json"
+echo "captured account token '$label' -> $STORE/$label.json (token-only)"
+
+# MCP handling. The shared MCP set (.mcpOAuth) is account-independent and lives
+# permanently in the live credentials file, so it is stored once in the canonical
+# mcp.json and restored into any account whose live MCP set was wiped by /login.
+if ! mcp_is_empty "$CRED"; then
+    # Live cred carries an MCP set: this is a fully-authed account. Capture it as
+    # the canonical shared set ("copy everything once").
+    if capture_mcp "$CRED" "$STORE/mcp.json"; then
+        echo "captured shared MCP set -> $STORE/mcp.json"
+    else
+        echo "warning: failed to capture shared MCP set into $STORE/mcp.json" >&2
+    fi
+elif [ -f "$STORE/mcp.json" ]; then
+    # Live MCP set is empty (a /login just wiped it) but a canonical set exists:
+    # restore it into the live cred so this account regains MCP access.
+    if restore_mcp "$STORE/mcp.json" "$CRED"; then
+        echo "restored shared MCP set from $STORE/mcp.json into live credentials"
+    else
+        echo "warning: failed to restore shared MCP set into live credentials" >&2
+    fi
+else
+    echo "warning: no shared MCP set captured yet and live MCP set is empty." >&2
+    echo "  Auth your MCP servers on the account that has them, then bootstrap THAT account first." >&2
+fi
 
 # Best-effort: capture this account's usage now using the live token.
 token=$(jq -r '.claudeAiOauth.accessToken' "$CRED")
@@ -53,10 +77,18 @@ echo "set active account to '$label'"
 cat <<EOF
 
 Next steps:
-  1. In claude, run /logout, then /login to the NEXT account.
-  2. Re-authenticate EVERY MCP server on that account.
-  3. Run: $HERE/bootstrap.sh <next-label>
-  4. Repeat 1-3 for each account you want to rotate.
-  5. When all accounts are captured, go live with:
-       touch $STORE/ENABLED
+  First account (the one with your MCP servers authed):
+    1. Auth EVERY MCP server on this account, then bootstrap it (done if you
+       just ran this on a fully-authed account: the shared MCP set is captured).
+  Each additional account:
+    2. In claude, run /login to the NEXT account.
+    3. Run: $HERE/bootstrap.sh <next-label>
+       If that /login happened to clear the MCP tokens, bootstrap restores the
+       shared set into the live credentials; if the MCP tokens survived the login
+       (often the case), bootstrap just refreshes the shared set. Either way the
+       account ends up with MCP access. Only claude.ai connectors need a per-account
+       reconnect in the UI.
+    4. Repeat 2-3 for each account you want to rotate.
+    5. When all accounts are captured, go live with:
+         touch $STORE/ENABLED
 EOF
