@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# Token rotator tick. Default: poll every bootstrapped account and swap the live
+# credentials file if the active account is under 5h pressure (Trigger A) or the
+# weekly usage across accounts is too divergent (Trigger B). `rotate.sh status`
+# is a dry read-out that computes and prints, but never writes or swaps.
+#
+# Utilization is on a 0-100 scale (Anthropic OAuth usage endpoint). Thresholds
+# come from config.env; see config.env.example.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$HERE/lib.sh"
+
+# Config: thresholds + account list. Real config.env is gitignored.
+# shellcheck source=/dev/null
+[ -f "${ROTATOR_CONFIG:-$HERE/config.env}" ] && source "${ROTATOR_CONFIG:-$HERE/config.env}"
+: "${FIVE_HOUR_PCT:=80}"
+: "${WEEKLY_DIVERGENCE_PCT:=20}"
+: "${INTERVAL_MIN:=15}"
+
+# Test hook: warn (stderr only, no store writes) when the usage mock is active so
+# a real run can never silently poll a mock instead of the real endpoint.
+if [ -n "${ROTATOR_USAGE_MOCK_DIR:-}" ]; then
+    printf '[warn] usage mock active (ROTATOR_USAGE_MOCK_DIR set); not polling the real endpoint\n' >&2
+fi
+
+DRY=0
+[ "${1:-}" = "status" ] && DRY=1
+
+# ENABLED gate: skip in dry mode so status always works. When live and the
+# sentinel is absent, exit immediately writing NOTHING (no log, no swap).
+if [ "$DRY" -eq 0 ] && [ ! -f "$STORE/ENABLED" ]; then
+    exit 0
+fi
+
+# Require the active pointer.
+if [ ! -f "$STORE/active" ]; then
+    if [ "$DRY" -eq 1 ]; then
+        echo "status: no active account set (store empty or not bootstrapped)"
+    else
+        log "no active account set"
+    fi
+    exit 0
+fi
+ACTIVE=$(cat "$STORE/active")
+
+# Account list comes only from config (ACCOUNTS). No store-derivation fallback.
+read -ra ACCT_ARR <<< "${ACCOUNTS:-}"
+N=${#ACCT_ARR[@]}
+
+# N=0: nothing configured. Log (or print in DRY) and exit; never swap.
+if [ "$N" -eq 0 ]; then
+    if [ "$DRY" -eq 1 ]; then
+        echo "status: no accounts configured (ACCOUNTS empty)"
+    else
+        log "no accounts configured"
+    fi
+    exit 0
+fi
+# N=1 is a monitored no-op: it flows through poll + decision + log below and
+# naturally never swaps (the only account equals ACTIVE, so target != ACTIVE
+# can never hold => HOLD).
+
+# sync-out (live only): capture any refresh/rotation of the active account's
+# tokens back into the store before we might swap it away. Never overwrite the
+# store from a partial/invalid live file.
+if [ "$DRY" -eq 0 ]; then
+    if valid_cred "$CRED"; then
+        # Identity guard: if the live cred's accessToken matches a DIFFERENT
+        # configured account's stored token, the pointer is desynced (someone
+        # /login'd out of band). Syncing out here would overwrite ACTIVE's slot
+        # with another account's creds, so bail without touching the store. A
+        # legitimate token refresh is a new token and matches no stored account.
+        live_tok=$(jq -r '.claudeAiOauth.accessToken' "$CRED")
+        for label in "${ACCT_ARR[@]}"; do
+            [ "$label" = "$ACTIVE" ] && continue
+            valid_cred "$STORE/$label.json" || continue
+            stored_tok=$(jq -r '.claudeAiOauth.accessToken' "$STORE/$label.json")
+            if [ "$stored_tok" = "$live_tok" ]; then
+                log "pointer desync: live cred matches $label but active=$ACTIVE; skipping tick (not syncing out or swapping)"
+                exit 0
+            fi
+        done
+        if ! atomic_replace "$CRED" "$STORE/$ACTIVE.json"; then
+            log "sync-out failed, skipping tick to avoid swapping on stale state"
+            exit 0
+        fi
+    else
+        log "live cred unreadable, skipping tick"
+        exit 0
+    fi
+fi
+
+# Poll usage for every account. ACTIVE uses the live file's token (freshest);
+# every other account uses its stored token. Parallel maps: value = utilization
+# string, empty string = UNKNOWN. Unknown values never fire a trigger.
+declare -A FIVE WEEK
+for label in "${ACCT_ARR[@]}"; do
+    FIVE[$label]=""
+    WEEK[$label]=""
+    token=""
+    if [ "$label" = "$ACTIVE" ]; then
+        if valid_cred "$CRED"; then
+            token=$(jq -r '.claudeAiOauth.accessToken' "$CRED")
+        fi
+    else
+        if valid_cred "$STORE/$label.json"; then
+            token=$(jq -r '.claudeAiOauth.accessToken' "$STORE/$label.json")
+        fi
+    fi
+
+    resp=""
+    [ -n "$token" ] && resp=$(fetch_usage "$token")
+
+    if [ -n "$resp" ] && printf '%s' "$resp" | jq -e '.five_hour' >/dev/null 2>&1; then
+        FIVE[$label]=$(printf '%s' "$resp" | jq -r '.five_hour.utilization // empty')
+        WEEK[$label]=$(printf '%s' "$resp" | jq -r '.seven_day.utilization // empty')
+        [ "$DRY" -eq 0 ] && write_usage "$label" "$resp"
+    elif [ -f "$STORE/$label.usage.json" ]; then
+        # Fetch failed (401/idle token): fall back to last-known stored usage.
+        FIVE[$label]=$(jq -r '.five_hour.utilization // empty' "$STORE/$label.usage.json" 2>/dev/null)
+        WEEK[$label]=$(jq -r '.seven_day.utilization // empty' "$STORE/$label.usage.json" 2>/dev/null)
+    fi
+done
+
+# Trigger A: ACTIVE 5h is KNOWN and >= FIVE_HOUR_PCT. Target = the non-ACTIVE
+# account with a KNOWN 5h and a valid stored cred that has the LOWEST 5h; ties
+# broken by lowest weekly.
+trigA=0
+if [ -n "${FIVE[$ACTIVE]:-}" ] && num_ge "${FIVE[$ACTIVE]}" "$FIVE_HOUR_PCT"; then
+    trigA=1
+fi
+targetA=""
+bestFive=""
+bestWeek=""
+if [ "$trigA" -eq 1 ]; then
+    for label in "${ACCT_ARR[@]}"; do
+        [ "$label" = "$ACTIVE" ] && continue
+        [ -n "${FIVE[$label]:-}" ] || continue
+        valid_cred "$STORE/$label.json" || continue
+        f=${FIVE[$label]}
+        w=${WEEK[$label]:-}
+        wc=$w
+        [ -z "$wc" ] && wc=999999
+        if [ -z "$targetA" ]; then
+            targetA=$label; bestFive=$f; bestWeek=$wc
+        elif num_lt "$f" "$bestFive"; then
+            targetA=$label; bestFive=$f; bestWeek=$wc
+        elif num_eq "$f" "$bestFive" && num_lt "$wc" "$bestWeek"; then
+            targetA=$label; bestFive=$f; bestWeek=$wc
+        fi
+    done
+fi
+
+# Trigger B: among accounts with KNOWN weekly, (max - min) >= WEEKLY_DIVERGENCE_PCT.
+# Target = the MIN-weekly account (must be != ACTIVE and have a valid stored cred).
+minLabel=""
+minWeek=""
+maxWeek=""
+for label in "${ACCT_ARR[@]}"; do
+    w=${WEEK[$label]:-}
+    [ -n "$w" ] || continue
+    if [ -z "$minWeek" ]; then
+        minWeek=$w; maxWeek=$w; minLabel=$label
+    else
+        num_lt "$w" "$minWeek" && { minWeek=$w; minLabel=$label; }
+        num_lt "$maxWeek" "$w" && maxWeek=$w
+    fi
+done
+trigB=0
+if [ -n "$minWeek" ] && \
+   awk -v mx="$maxWeek" -v mn="$minWeek" -v t="$WEEKLY_DIVERGENCE_PCT" 'BEGIN { exit ((mx - mn) >= t) ? 0 : 1 }'; then
+    trigB=1
+fi
+targetB=""
+if [ "$trigB" -eq 1 ] && [ -n "$minLabel" ] && [ "$minLabel" != "$ACTIVE" ] \
+    && valid_cred "$STORE/$minLabel.json"; then
+    targetB=$minLabel
+fi
+
+# Decide. Trigger A wins over Trigger B when both fire.
+target=""
+reason=""
+if [ "$trigA" -eq 1 ] && [ -n "$targetA" ]; then
+    target=$targetA
+    reason="5h pressure (active=${FIVE[$ACTIVE]} >= $FIVE_HOUR_PCT) -> $target"
+elif [ "$trigB" -eq 1 ] && [ -n "$targetB" ]; then
+    target=$targetB
+    reason="weekly divergence ($maxWeek-$minWeek >= $WEEKLY_DIVERGENCE_PCT) -> $target"
+fi
+
+SHOULD_SWAP=0
+if [ -n "$target" ] && [ "$target" != "$ACTIVE" ] && valid_cred "$STORE/$target.json"; then
+    SHOULD_SWAP=1
+fi
+if [ "$SHOULD_SWAP" -eq 0 ]; then
+    if [ "$trigA" -eq 1 ] || [ "$trigB" -eq 1 ]; then
+        reason="trigger fired but no valid target; holding on $ACTIVE"
+    else
+        reason="no trigger"
+    fi
+fi
+
+# One decision line with every account's (5h, weekly).
+usages=""
+for label in "${ACCT_ARR[@]}"; do
+    usages="$usages $label(5h=${FIVE[$label]:-?},wk=${WEEK[$label]:-?})"
+done
+decision=HOLD
+[ "$SHOULD_SWAP" -eq 1 ] && decision=SWAP
+line="active=$ACTIVE trigA=$trigA trigB=$trigB target=${target:-none} decision=$decision reason=$reason usages:$usages"
+
+if [ "$DRY" -eq 1 ]; then
+    echo "status: $line"
+    exit 0
+fi
+
+log "$line"
+
+if [ "$SHOULD_SWAP" -eq 1 ]; then
+    if atomic_replace "$STORE/$target.json" "$CRED"; then
+        write_active "$target"
+        log "SWAP $ACTIVE -> $target: $reason (usages:$usages)"
+    else
+        log "SWAP FAILED ($ACTIVE -> $target): live cred and pointer unchanged"
+    fi
+fi
+
+exit 0
