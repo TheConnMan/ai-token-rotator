@@ -133,6 +133,7 @@ setup_sandbox() {
 # Store account files are TOKEN-ONLY now (no .mcpOAuth), so seed with make_token_store.
 seed_account() { make_token_store "$STORE/$1.json" "$2"; }
 set_active()   { printf '%s' "$1" > "$STORE/active"; }
+set_pin() { printf '%s' "$1" > "$STORE/PIN"; }
 enable()       { : > "$STORE/ENABLED"; }
 
 # run_rotate [args...] - invoke the real rotate.sh with the sandbox env. Sets
@@ -143,6 +144,17 @@ run_rotate() {
     ROTATOR_CONFIG="$CONFIG" \
     ROTATOR_USAGE_MOCK_DIR="$MOCK" \
         bash "$ROTATE" "$@"
+    RC=$?
+}
+
+run_rotate_status_out() {
+    OUT=$(
+        ROTATOR_STORE="$STORE" \
+        ROTATOR_CRED="$CRED" \
+        ROTATOR_CONFIG="$CONFIG" \
+        ROTATOR_USAGE_MOCK_DIR="$MOCK" \
+            bash "$ROTATE" status
+    )
     RC=$?
 }
 
@@ -641,6 +653,164 @@ EOF
         "grow-merge preserved canonical-only srvB"
 }
 
+scenario_pin_forces_swap_over_trigger() {
+    make_config "$CONFIG" "acctA acctB acctC"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    seed_account acctC "tok-acctC"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 10
+    make_mock "$MOCK" "tok-acctB" 20 10
+    make_mock "$MOCK" "tok-acctC" 80 10
+    set_pin acctC
+
+    run_rotate
+    assert_exit 0 "$RC" "pin-forces-swap exits 0"
+    assert_eq "acctC" "$(active_label)" "pin-forces-swap active pointer is acctC"
+    assert_cred_token "$CRED" "tok-acctC" "pin-forces-swap live cred is acctC"
+}
+
+scenario_pin_swap_preserves_live_mcp() {
+    make_config "$CONFIG" "acctA acctB acctC"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    seed_account acctC "tok-acctC"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 10
+    make_mock "$MOCK" "tok-acctB" 20 10
+    make_mock "$MOCK" "tok-acctC" 80 10
+    set_pin acctC
+
+    run_rotate
+    assert_exit 0 "$RC" "pin-preserves-mcp exits 0"
+    assert_cred_token "$CRED" "tok-acctC" "pin-preserves-mcp live cred is acctC"
+    assert_mcp_token "$CRED" "server-x" "mcp-tok-acctA" \
+        "pin-preserves-mcp kept live MCP token"
+}
+
+scenario_pin_already_active_no_swap_still_pinned() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 10
+    make_mock "$MOCK" "tok-acctB" 20 10
+    set_pin acctA
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "pin-already-active status exits 0"
+    case "$OUT" in
+        *decision=PINNED*) ;;
+        *) fail "pin-already-active status did not include decision=PINNED" ;;
+    esac
+    case "$OUT" in
+        *decision=SWAP*) fail "pin-already-active status included decision=SWAP" ;;
+    esac
+    case "$OUT" in
+        *decision=HOLD*) fail "pin-already-active status included decision=HOLD" ;;
+    esac
+    assert_eq "acctA" "$(active_label)" "pin-already-active pointer unchanged"
+}
+
+scenario_pin_decision_literal_not_hold() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 10
+    make_mock "$MOCK" "tok-acctB" 10 10
+    set_pin acctA
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "pin-literal status exits 0"
+    case "$OUT" in
+        *decision=PINNED*) ;;
+        *) fail "pin-literal status did not include decision=PINNED" ;;
+    esac
+    case "$OUT" in
+        *decision=HOLD*) fail "pin-literal status included decision=HOLD" ;;
+    esac
+}
+
+scenario_pin_absent_unchanged_swap() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 10
+    make_mock "$MOCK" "tok-acctB" 20 10
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "pin-absent status exits 0"
+    case "$OUT" in
+        *decision=SWAP*) ;;
+        *) fail "pin-absent status did not include decision=SWAP" ;;
+    esac
+    case "$OUT" in
+        *decision=PINNED*) fail "pin-absent status included decision=PINNED" ;;
+    esac
+
+    run_rotate
+    assert_exit 0 "$RC" "pin-absent live exits 0"
+    assert_eq "acctB" "$(active_label)" "pin-absent live swapped to acctB"
+    assert_cred_token "$CRED" "tok-acctB" "pin-absent live cred is acctB"
+}
+
+scenario_pin_invalid_target_holds_but_pinned() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 10
+    set_pin acctB
+
+    run_rotate
+    assert_exit 0 "$RC" "pin-invalid-target live exits 0"
+    assert_eq "acctA" "$(active_label)" "pin-invalid-target pointer unchanged"
+    assert_cred_token "$CRED" "tok-acctA" "pin-invalid-target live cred unchanged"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "pin-invalid-target status exits 0"
+    case "$OUT" in
+        *decision=PINNED*) ;;
+        *) fail "pin-invalid-target status did not include decision=PINNED" ;;
+    esac
+}
+
+scenario_pin_unconfigured_label_holds() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 10
+    make_token_store "$STORE/acctZ.json" "tok-acctZ"
+    set_pin acctZ
+
+    run_rotate
+    assert_exit 0 "$RC" "pin-unconfigured live exits 0"
+    assert_eq "acctA" "$(active_label)" "pin-unconfigured pointer unchanged (no swap to acctZ)"
+    assert_cred_token "$CRED" "tok-acctA" "pin-unconfigured live cred unchanged"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "pin-unconfigured status exits 0"
+    case "$OUT" in
+        *decision=PINNED*) ;;
+        *) fail "pin-unconfigured status did not include decision=PINNED" ;;
+    esac
+}
+
 # ============================================================================
 # Runner
 # ============================================================================
@@ -682,6 +852,13 @@ run_scenario "Bootstrap token-only store + canonical mcp.json" scenario_bootstra
 run_scenario "Bootstrap restores MCP after /login wipe"        scenario_bootstrap_restores_mcp_after_login_wipe
 run_scenario "Swap copy failure holds pointer + live cred"     scenario_swap_failure_holds_pointer
 run_scenario "sync-out capture_mcp grows, never shrinks"       scenario_synced_capture_mcp_grows_not_shrinks
+run_scenario "PIN forces swap over trigger"                    scenario_pin_forces_swap_over_trigger
+run_scenario "PIN swap preserves live mcpOAuth"                 scenario_pin_swap_preserves_live_mcp
+run_scenario "PIN already active reports PINNED"                scenario_pin_already_active_no_swap_still_pinned
+run_scenario "PIN decision literal is not HOLD"                 scenario_pin_decision_literal_not_hold
+run_scenario "PIN absent keeps swap behavior"                   scenario_pin_absent_unchanged_swap
+run_scenario "PIN invalid target holds and reports PINNED"      scenario_pin_invalid_target_holds_but_pinned
+run_scenario "PIN unconfigured label holds (not in ACCOUNTS)"   scenario_pin_unconfigured_label_holds
 
 printf '\n----------------------------------------\n'
 printf 'Summary: %d passed, %d failed\n' "$PASS" "$FAILED"

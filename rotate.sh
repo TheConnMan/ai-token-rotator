@@ -62,6 +62,19 @@ fi
 # naturally never swaps (the only account equals ACTIVE, so target != ACTIVE
 # can never hold => HOLD).
 
+# PIN sentinel: an operator (bonus drain) can force the rotator onto a specific
+# account by writing its label to $STORE/PIN. While present we force
+# active=<label> by swapping in its stored token and SUSPEND Trigger A/B,
+# emitting decision=PINNED. A stale PIN pins forever by design; the writer owns
+# cleanup. PINNED is distinct from the HOLD decision, which means a trigger did
+# not fire this tick. PINNED means swap decisions are operator driven.
+PINNED=0
+PIN_LABEL=""
+if [ -f "$STORE/PIN" ]; then
+    PINNED=1
+    PIN_LABEL=$(cat "$STORE/PIN" 2>/dev/null)
+fi
+
 # sync-out (live only): capture any refresh/rotation of the active account's
 # tokens back into the store before we might swap it away. Never overwrite the
 # store from a partial/invalid live file.
@@ -131,70 +144,84 @@ for label in "${ACCT_ARR[@]}"; do
     fi
 done
 
-# Trigger A: ACTIVE 5h is KNOWN and >= FIVE_HOUR_PCT. Target = the non-ACTIVE
-# account with a KNOWN 5h and a valid stored cred that has the LOWEST 5h; ties
-# broken by lowest weekly.
 trigA=0
-if [ -n "${FIVE[$ACTIVE]:-}" ] && num_ge "${FIVE[$ACTIVE]}" "$FIVE_HOUR_PCT"; then
-    trigA=1
-fi
 targetA=""
 bestFive=""
 bestWeek=""
-if [ "$trigA" -eq 1 ]; then
-    for label in "${ACCT_ARR[@]}"; do
-        [ "$label" = "$ACTIVE" ] && continue
-        [ -n "${FIVE[$label]:-}" ] || continue
-        valid_cred "$STORE/$label.json" || continue
-        f=${FIVE[$label]}
-        w=${WEEK[$label]:-}
-        wc=$w
-        [ -z "$wc" ] && wc=999999
-        if [ -z "$targetA" ]; then
-            targetA=$label; bestFive=$f; bestWeek=$wc
-        elif num_lt "$f" "$bestFive"; then
-            targetA=$label; bestFive=$f; bestWeek=$wc
-        elif num_eq "$f" "$bestFive" && num_lt "$wc" "$bestWeek"; then
-            targetA=$label; bestFive=$f; bestWeek=$wc
-        fi
-    done
-fi
-
-# Trigger B: among accounts with KNOWN weekly, (max - min) >= WEEKLY_DIVERGENCE_PCT.
-# Target = the MIN-weekly account (must be != ACTIVE and have a valid stored cred).
 minLabel=""
 minWeek=""
 maxWeek=""
-for label in "${ACCT_ARR[@]}"; do
-    w=${WEEK[$label]:-}
-    [ -n "$w" ] || continue
-    if [ -z "$minWeek" ]; then
-        minWeek=$w; maxWeek=$w; minLabel=$label
-    else
-        num_lt "$w" "$minWeek" && { minWeek=$w; minLabel=$label; }
-        num_lt "$maxWeek" "$w" && maxWeek=$w
-    fi
-done
 trigB=0
-if [ -n "$minWeek" ] && \
-   awk -v mx="$maxWeek" -v mn="$minWeek" -v t="$WEEKLY_DIVERGENCE_PCT" 'BEGIN { exit ((mx - mn) >= t) ? 0 : 1 }'; then
-    trigB=1
-fi
 targetB=""
-if [ "$trigB" -eq 1 ] && [ -n "$minLabel" ] && [ "$minLabel" != "$ACTIVE" ] \
-    && valid_cred "$STORE/$minLabel.json"; then
-    targetB=$minLabel
-fi
-
-# Decide. Trigger A wins over Trigger B when both fire.
 target=""
 reason=""
-if [ "$trigA" -eq 1 ] && [ -n "$targetA" ]; then
-    target=$targetA
-    reason="5h pressure (active=${FIVE[$ACTIVE]} >= $FIVE_HOUR_PCT) -> $target"
-elif [ "$trigB" -eq 1 ] && [ -n "$targetB" ]; then
-    target=$targetB
-    reason="weekly divergence ($maxWeek-$minWeek >= $WEEKLY_DIVERGENCE_PCT) -> $target"
+if [ "$PINNED" -eq 0 ]; then
+    # Trigger A: ACTIVE 5h is KNOWN and >= FIVE_HOUR_PCT. Target = the
+    # non-ACTIVE account with a KNOWN 5h and a valid stored cred that has the
+    # LOWEST 5h; ties broken by lowest weekly.
+    if [ -n "${FIVE[$ACTIVE]:-}" ] && num_ge "${FIVE[$ACTIVE]}" "$FIVE_HOUR_PCT"; then
+        trigA=1
+    fi
+    if [ "$trigA" -eq 1 ]; then
+        for label in "${ACCT_ARR[@]}"; do
+            [ "$label" = "$ACTIVE" ] && continue
+            [ -n "${FIVE[$label]:-}" ] || continue
+            valid_cred "$STORE/$label.json" || continue
+            f=${FIVE[$label]}
+            w=${WEEK[$label]:-}
+            wc=$w
+            [ -z "$wc" ] && wc=999999
+            if [ -z "$targetA" ]; then
+                targetA=$label; bestFive=$f; bestWeek=$wc
+            elif num_lt "$f" "$bestFive"; then
+                targetA=$label; bestFive=$f; bestWeek=$wc
+            elif num_eq "$f" "$bestFive" && num_lt "$wc" "$bestWeek"; then
+                targetA=$label; bestFive=$f; bestWeek=$wc
+            fi
+        done
+    fi
+
+    # Trigger B: among accounts with KNOWN weekly, (max - min) >= WEEKLY_DIVERGENCE_PCT.
+    # Target = the MIN-weekly account (must be != ACTIVE and have a valid stored cred).
+    for label in "${ACCT_ARR[@]}"; do
+        w=${WEEK[$label]:-}
+        [ -n "$w" ] || continue
+        if [ -z "$minWeek" ]; then
+            minWeek=$w; maxWeek=$w; minLabel=$label
+        else
+            num_lt "$w" "$minWeek" && { minWeek=$w; minLabel=$label; }
+            num_lt "$maxWeek" "$w" && maxWeek=$w
+        fi
+    done
+    if [ -n "$minWeek" ] && \
+       awk -v mx="$maxWeek" -v mn="$minWeek" -v t="$WEEKLY_DIVERGENCE_PCT" 'BEGIN { exit ((mx - mn) >= t) ? 0 : 1 }'; then
+        trigB=1
+    fi
+    if [ "$trigB" -eq 1 ] && [ -n "$minLabel" ] && [ "$minLabel" != "$ACTIVE" ] \
+        && valid_cred "$STORE/$minLabel.json"; then
+        targetB=$minLabel
+    fi
+
+    # Decide. Trigger A wins over Trigger B when both fire.
+    if [ "$trigA" -eq 1 ] && [ -n "$targetA" ]; then
+        target=$targetA
+        reason="5h pressure (active=${FIVE[$ACTIVE]} >= $FIVE_HOUR_PCT) -> $target"
+    elif [ "$trigB" -eq 1 ] && [ -n "$targetB" ]; then
+        target=$targetB
+        reason="weekly divergence ($maxWeek-$minWeek >= $WEEKLY_DIVERGENCE_PCT) -> $target"
+    fi
+else
+    # PIN: swaps are operator driven; autonomous triggers are suspended. Only a CONFIGURED
+    # account (present in ACCOUNTS) may become the target; pinning a label the rotator does
+    # not manage would strand `active` on an account later ticks never poll, so an
+    # unconfigured or empty PIN holds on ACTIVE (still decision=PINNED).
+    trigA=0
+    trigB=0
+    target=""
+    for _pl in "${ACCT_ARR[@]}"; do
+        [ "$_pl" = "$PIN_LABEL" ] && { target="$PIN_LABEL"; break; }
+    done
+    reason="pinned to ${PIN_LABEL:-<empty>}"
 fi
 
 SHOULD_SWAP=0
@@ -202,7 +229,13 @@ if [ -n "$target" ] && [ "$target" != "$ACTIVE" ] && valid_cred "$STORE/$target.
     SHOULD_SWAP=1
 fi
 if [ "$SHOULD_SWAP" -eq 0 ]; then
-    if [ "$trigA" -eq 1 ] || [ "$trigB" -eq 1 ]; then
+    if [ "$PINNED" -eq 1 ]; then
+        if [ "$target" = "$ACTIVE" ]; then
+            reason="pinned to $PIN_LABEL (already active)"
+        else
+            reason="pinned to ${PIN_LABEL:-<empty>} but target invalid; holding on $ACTIVE"
+        fi
+    elif [ "$trigA" -eq 1 ] || [ "$trigB" -eq 1 ]; then
         reason="trigger fired but no valid target; holding on $ACTIVE"
     else
         reason="no trigger"
@@ -216,6 +249,7 @@ for label in "${ACCT_ARR[@]}"; do
 done
 decision=HOLD
 [ "$SHOULD_SWAP" -eq 1 ] && decision=SWAP
+[ "$PINNED" -eq 1 ] && decision=PINNED
 line="active=$ACTIVE trigA=$trigA trigB=$trigB target=${target:-none} decision=$decision reason=$reason usages:$usages"
 
 if [ "$DRY" -eq 1 ]; then
