@@ -1,0 +1,7 @@
+# Real config with account labels stays local; commit config.env.example instead
+config.env
+
+# Never commit anything resembling credentials or the runtime store
+*.credentials.json
+accounts/
+*.log

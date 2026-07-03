@@ -1,0 +1,6 @@
+[Unit]
+Description=Claude Max two-account OAuth token rotator (no-ops until accounts/ENABLED exists)
+
+[Service]
+Type=oneshot
+ExecStart=%h/ai-token-rotator/rotate.sh

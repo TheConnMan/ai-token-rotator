@@ -1,0 +1,10 @@
+[Unit]
+Description=Claude Max token rotator timer (every 15 minutes; safe until accounts/ENABLED exists)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
