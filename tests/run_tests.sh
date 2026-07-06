@@ -359,6 +359,110 @@ scenario_both_triggers_a_priority() {
     assert_cred_token "$CRED" "tok-acctB" "both-triggers live cred is acctB"
 }
 
+# Trigger B must never target an account whose KNOWN 5h is >= FIVE_HOUR_PCT.
+# active=acctB. acctA is the min-weekly (10) but its 5h is maxed (90), so it is a
+# pressured target. acctB itself is fine on 5h (5) but high weekly (60). The
+# divergence (60-10=50 >= 20) satisfies Trigger B's condition, yet its ONLY
+# candidate (acctA) is 5h-pressured, so there is no valid target => HOLD on acctB.
+# Today this FAILS: the rotator swaps to the pressured min-weekly account (acctA).
+scenario_weekly_rebalance_skips_pressured_target() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctB
+    enable
+    make_cred "$CRED" "tok-acctB"
+    make_mock "$MOCK" "tok-acctA" 90 10   # min weekly, but 5h pressured => not a valid target
+    make_mock "$MOCK" "tok-acctB" 5 60    # active: 5h fine, high weekly => divergence fires
+
+    # status is non-mutating: the decision line must report HOLD with no target.
+    run_rotate_status_out
+    assert_exit 0 "$RC" "weekly-skip-pressured status exits 0"
+    case "$OUT" in
+        *decision=HOLD*) ;;
+        *) fail "weekly-skip-pressured status did not include decision=HOLD" ;;
+    esac
+    case "$OUT" in
+        *target=none*) ;;
+        *) fail "weekly-skip-pressured status did not include target=none" ;;
+    esac
+
+    # A live tick must not move off acctB (no swap to the pressured min-weekly acctA).
+    run_rotate
+    assert_exit 0 "$RC" "weekly-skip-pressured exits 0"
+    assert_eq "acctB" "$(active_label)" "weekly-skip-pressured held on acctB (no swap to pressured acctA)"
+    assert_cred_token "$CRED" "tok-acctB" "weekly-skip-pressured live cred still acctB"
+}
+
+# The core anti-flap case over multiple ticks. active=acctA with 5h maxed (90) and
+# low weekly (10); acctB fresh on 5h (5) but high weekly (60) so divergence=50.
+# Tick1 Trigger A relieves 5h => swap A to B. Ticks 2,3,4 must HOLD on acctB:
+# Trigger B's only min-weekly candidate is acctA, still 5h-pressured, so there is
+# no valid target and the pointer stays on B. Today ticks 2 and 4 flap back to
+# acctA (Trigger B targets the pressured account), so this FAILS.
+scenario_no_flap_while_5h_pressured() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 10   # active: 5h maxed, low weekly
+    make_mock "$MOCK" "tok-acctB" 5 60    # fresh 5h, high weekly => divergence 50
+
+    run_rotate
+    assert_exit 0 "$RC" "no-flap tick1 exits 0"
+    assert_eq "acctB" "$(active_label)" "no-flap tick1 relieved 5h => swap to acctB"
+
+    run_rotate
+    assert_exit 0 "$RC" "no-flap tick2 exits 0"
+    assert_eq "acctB" "$(active_label)" "no-flap tick2 held on acctB (acctA still 5h-pressured)"
+
+    run_rotate
+    assert_exit 0 "$RC" "no-flap tick3 exits 0"
+    assert_eq "acctB" "$(active_label)" "no-flap tick3 held on acctB (acctA still 5h-pressured)"
+
+    run_rotate
+    assert_exit 0 "$RC" "no-flap tick4 exits 0"
+    assert_eq "acctB" "$(active_label)" "no-flap tick4 held on acctB (acctA still 5h-pressured)"
+}
+
+# Continues the anti-flap window: once acctA's 5h resets below threshold, Trigger B
+# may legitimately rebalance to it. Same start as the no-flap case: 2 ticks park us
+# on acctB (tick1 relief, tick2 hold). Then acctA's 5h resets to 10 (weekly stays
+# 10). The next tick moves the pointer to acctA (usable min-weekly target) and the
+# tick after HOLDs there (acctA is now active AND min-weekly, no valid target).
+scenario_settles_on_low_weekly_after_5h_reset() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 10   # acctA 5h-pressured for the first window
+    make_mock "$MOCK" "tok-acctB" 5 60
+
+    run_rotate
+    assert_exit 0 "$RC" "settles tick1 exits 0"
+    run_rotate
+    assert_exit 0 "$RC" "settles tick2 exits 0"
+    # After the fix we are parked on acctB (tick1 relief, tick2 hold). Today we have
+    # already flapped back to acctA by now, so this checkpoint FAILS today.
+    assert_eq "acctB" "$(active_label)" "settles parked on acctB after 2 ticks"
+
+    # acctA's 5h resets below threshold; it becomes a usable rebalance target.
+    make_mock "$MOCK" "tok-acctA" 10 10
+
+    run_rotate
+    assert_exit 0 "$RC" "settles tick3 exits 0"
+    assert_eq "acctA" "$(active_label)" "settles rebalanced to acctA once its 5h reset"
+
+    run_rotate
+    assert_exit 0 "$RC" "settles tick4 exits 0"
+    assert_eq "acctA" "$(active_label)" "settles held on acctA (now active min-weekly, no target)"
+    assert_cred_token "$CRED" "tok-acctA" "settles live cred is acctA"
+}
+
 # sync-out before swap: a token refresh in the live cred is captured into the
 # OLD active's <label>.json before the swap replaces the live file.
 scenario_sync_out_before_swap() {
@@ -839,6 +943,9 @@ run_scenario "Trigger A swaps to lowest-5h other (of 3)"       scenario_trigger_
 run_scenario "Trigger B swaps to min-weekly"                   scenario_trigger_b_min_weekly
 run_scenario "Trigger B below threshold => no swap"            scenario_trigger_b_below_threshold
 run_scenario "Both triggers => A target wins"                  scenario_both_triggers_a_priority
+run_scenario "Trigger B skips 5h-pressured min-weekly target"  scenario_weekly_rebalance_skips_pressured_target
+run_scenario "No flap while active-5h stays pressured"         scenario_no_flap_while_5h_pressured
+run_scenario "Settles on low-weekly after 5h reset"            scenario_settles_on_low_weekly_after_5h_reset
 run_scenario "sync-out captures refresh before swap"           scenario_sync_out_before_swap
 run_scenario "Invalid live cred => skip, store untouched"      scenario_invalid_live_cred_skips
 run_scenario "Target missing/invalid => no swap"               scenario_target_invalid_no_swap

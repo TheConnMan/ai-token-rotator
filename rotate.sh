@@ -148,9 +148,10 @@ trigA=0
 targetA=""
 bestFive=""
 bestWeek=""
-minLabel=""
 minWeek=""
 maxWeek=""
+minEligLabel=""
+minEligWeek=""
 trigB=0
 targetB=""
 target=""
@@ -181,15 +182,15 @@ if [ "$PINNED" -eq 0 ]; then
         done
     fi
 
-    # Trigger B: among accounts with KNOWN weekly, (max - min) >= WEEKLY_DIVERGENCE_PCT.
-    # Target = the MIN-weekly account (must be != ACTIVE and have a valid stored cred).
+    # Trigger B firing condition: among accounts with KNOWN weekly, the spread
+    # (max - min) over ALL of them is >= WEEKLY_DIVERGENCE_PCT.
     for label in "${ACCT_ARR[@]}"; do
         w=${WEEK[$label]:-}
         [ -n "$w" ] || continue
         if [ -z "$minWeek" ]; then
-            minWeek=$w; maxWeek=$w; minLabel=$label
+            minWeek=$w; maxWeek=$w
         else
-            num_lt "$w" "$minWeek" && { minWeek=$w; minLabel=$label; }
+            num_lt "$w" "$minWeek" && minWeek=$w
             num_lt "$maxWeek" "$w" && maxWeek=$w
         fi
     done
@@ -197,9 +198,29 @@ if [ "$PINNED" -eq 0 ]; then
        awk -v mx="$maxWeek" -v mn="$minWeek" -v t="$WEEKLY_DIVERGENCE_PCT" 'BEGIN { exit ((mx - mn) >= t) ? 0 : 1 }'; then
         trigB=1
     fi
-    if [ "$trigB" -eq 1 ] && [ -n "$minLabel" ] && [ "$minLabel" != "$ACTIVE" ] \
-        && valid_cred "$STORE/$minLabel.json"; then
-        targetB=$minLabel
+    # Trigger B target: the MIN-weekly account among the ELIGIBLE set only, i.e.
+    # accounts whose KNOWN 5h is NOT >= FIVE_HOUR_PCT. A 5h-pressured account is not
+    # a valid rebalance destination: parking the pointer on it just trips Trigger A
+    # next tick and bounces it right back, a stateless per-tick flap between the two
+    # triggers. Do NOT drop this exclusion. Unknown 5h counts as NOT pressured (same
+    # convention as "unknown never fires a trigger"), so it stays eligible. Picking
+    # the min over the eligible set (not the global min used for divergence above)
+    # is what keeps Trigger B from chasing a pressured min-weekly account.
+    for label in "${ACCT_ARR[@]}"; do
+        w=${WEEK[$label]:-}
+        [ -n "$w" ] || continue
+        if [ -n "${FIVE[$label]:-}" ] && num_ge "${FIVE[$label]}" "$FIVE_HOUR_PCT"; then
+            continue
+        fi
+        if [ -z "$minEligWeek" ]; then
+            minEligWeek=$w; minEligLabel=$label
+        elif num_lt "$w" "$minEligWeek"; then
+            minEligWeek=$w; minEligLabel=$label
+        fi
+    done
+    if [ "$trigB" -eq 1 ] && [ -n "$minEligLabel" ] && [ "$minEligLabel" != "$ACTIVE" ] \
+        && valid_cred "$STORE/$minEligLabel.json"; then
+        targetB=$minEligLabel
     fi
 
     # Decide. Trigger A wins over Trigger B when both fire.
