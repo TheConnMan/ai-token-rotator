@@ -106,8 +106,10 @@ make_mock() {
 EOF
 }
 
-# make_config <path> <accounts> - write a config.env. Thresholds are the SPEC
-# defaults (FIVE_HOUR_PCT=80, WEEKLY_DIVERGENCE_PCT=20).
+# make_config <path> <accounts> - write a config.env. Thresholds are pinned for
+# scenario determinism (FIVE_HOUR_PCT=80, WEEKLY_DIVERGENCE_PCT=20); the divergence
+# mocks below are calibrated to a 20 threshold, so this pin is intentional and does
+# not track the SPEC default.
 make_config() {
     local path="$1" accounts="$2"
     cat > "$path" <<EOF

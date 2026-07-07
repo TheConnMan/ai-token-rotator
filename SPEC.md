@@ -52,7 +52,7 @@ suite never touches the real `~/.claude`:
 ## Config (`config.env`; commit `config.env.example`, gitignore the real `config.env`)
 
 - `FIVE_HOUR_PCT=80`            swap when the active account's 5h utilization >= this
-- `WEEKLY_DIVERGENCE_PCT=20`    swap when (max weekly - min weekly across accounts) >= this
+- `WEEKLY_DIVERGENCE_PCT=10`    swap when (max weekly - min weekly across accounts) >= this
 - `INTERVAL_MIN=15`            systemd timer cadence
 - `ACCOUNTS="acctA acctB"`     space-separated labels; N accounts
 

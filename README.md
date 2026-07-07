@@ -97,7 +97,7 @@ writing nothing). No need to stop the timer to pause.
 
 - `FIVE_HOUR_PCT` (default 80): swap when the active account's 5h utilization is
   at or above this.
-- `WEEKLY_DIVERGENCE_PCT` (default 20): swap when the spread between the highest
+- `WEEKLY_DIVERGENCE_PCT` (default 10): swap when the spread between the highest
   and lowest weekly utilization across accounts is at or above this.
 - `INTERVAL_MIN` (default 15): timer cadence in minutes.
 - `ACCOUNTS` (required): space-separated labels, one per bootstrapped account.

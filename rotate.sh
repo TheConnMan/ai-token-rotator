@@ -16,7 +16,7 @@ source "$HERE/lib.sh"
 # shellcheck source=/dev/null
 [ -f "${ROTATOR_CONFIG:-$HERE/config.env}" ] && source "${ROTATOR_CONFIG:-$HERE/config.env}"
 : "${FIVE_HOUR_PCT:=80}"
-: "${WEEKLY_DIVERGENCE_PCT:=20}"
+: "${WEEKLY_DIVERGENCE_PCT:=10}"
 : "${INTERVAL_MIN:=15}"
 
 # Test hook: warn (stderr only, no store writes) when the usage mock is active so
