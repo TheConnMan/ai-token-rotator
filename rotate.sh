@@ -17,6 +17,10 @@ source "$HERE/lib.sh"
 [ -f "${ROTATOR_CONFIG:-$HERE/config.env}" ] && source "${ROTATOR_CONFIG:-$HERE/config.env}"
 : "${FIVE_HOUR_PCT:=80}"
 : "${WEEKLY_DIVERGENCE_PCT:=10}"
+: "${WEEKLY_DIVERGENCE_HI_FLOOR:=80}"    # when the min weekly is >= this, dead zone shrinks...
+: "${WEEKLY_DIVERGENCE_HI_PCT:=5}"       # ...to this
+: "${WEEKLY_DIVERGENCE_VHI_FLOOR:=90}"   # when the min weekly is >= this, dead zone shrinks...
+: "${WEEKLY_DIVERGENCE_VHI_PCT:=2.5}"    # ...to this (tightest near the 100 ceiling)
 : "${INTERVAL_MIN:=15}"
 
 # Test hook: warn (stderr only, no store writes) when the usage mock is active so
@@ -156,6 +160,7 @@ trigB=0
 targetB=""
 target=""
 reason=""
+effZone=""
 if [ "$PINNED" -eq 0 ]; then
     # Trigger A: ACTIVE 5h is KNOWN and >= FIVE_HOUR_PCT. Target = the
     # non-ACTIVE account with a KNOWN 5h and a valid stored cred that has the
@@ -194,9 +199,11 @@ if [ "$PINNED" -eq 0 ]; then
             num_lt "$maxWeek" "$w" && maxWeek=$w
         fi
     done
-    if [ -n "$minWeek" ] && \
-       awk -v mx="$maxWeek" -v mn="$minWeek" -v t="$WEEKLY_DIVERGENCE_PCT" 'BEGIN { exit ((mx - mn) >= t) ? 0 : 1 }'; then
-        trigB=1
+    if [ -n "$minWeek" ]; then
+        effZone=$(weekly_dead_zone "$minWeek")
+        if awk -v mx="$maxWeek" -v mn="$minWeek" -v t="$effZone" 'BEGIN { exit ((mx - mn) >= t) ? 0 : 1 }'; then
+            trigB=1
+        fi
     fi
     # Trigger B target: the MIN-weekly account among the ELIGIBLE set only, i.e.
     # accounts whose KNOWN 5h is NOT >= FIVE_HOUR_PCT. A 5h-pressured account is not
@@ -229,7 +236,7 @@ if [ "$PINNED" -eq 0 ]; then
         reason="5h pressure (active=${FIVE[$ACTIVE]} >= $FIVE_HOUR_PCT) -> $target"
     elif [ "$trigB" -eq 1 ] && [ -n "$targetB" ]; then
         target=$targetB
-        reason="weekly divergence ($maxWeek-$minWeek >= $WEEKLY_DIVERGENCE_PCT) -> $target"
+        reason="weekly divergence ($maxWeek-$minWeek >= $effZone) -> $target"
     fi
 else
     # PIN: swaps are operator driven; autonomous triggers are suspended. Only a CONFIGURED

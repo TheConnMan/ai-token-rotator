@@ -52,7 +52,7 @@ suite never touches the real `~/.claude`:
 ## Config (`config.env`; commit `config.env.example`, gitignore the real `config.env`)
 
 - `FIVE_HOUR_PCT=80`            swap when the active account's 5h utilization >= this
-- `WEEKLY_DIVERGENCE_PCT=10`    swap when (max weekly - min weekly across accounts) >= this
+- `WEEKLY_DIVERGENCE_PCT=10`    base dead zone; swap when (max weekly - min weekly across accounts) >= this. Tightens adaptively as the floor (min weekly) climbs: to `WEEKLY_DIVERGENCE_HI_PCT=5` at floor >= `WEEKLY_DIVERGENCE_HI_FLOOR=80`, and to `WEEKLY_DIVERGENCE_VHI_PCT=2.5` at floor >= `WEEKLY_DIVERGENCE_VHI_FLOOR=90` (all configurable)
 - `INTERVAL_MIN=15`            systemd timer cadence
 - `ACCOUNTS="acctA acctB"`     space-separated labels; N accounts
 
@@ -107,7 +107,9 @@ Default is the tick. `status` is a dry read-out: compute and print, never write 
    - Trigger A (5h pressure): ACTIVE `five_hour.utilization >= FIVE_HOUR_PCT`.
      Target = the account other than ACTIVE with the LOWEST `five_hour.utilization`.
    - Trigger B (weekly divergence): across accounts with known weekly,
-     `(max - min) >= WEEKLY_DIVERGENCE_PCT`. Target = the account with MIN weekly.
+     `(max - min) >= effective dead zone`. The dead zone is `WEEKLY_DIVERGENCE_PCT`
+     by default, tightening to 5 when the floor (min weekly) is >= 80 and to 2.5 when
+     it is >= 90 (configurable). Target = the account with MIN weekly.
    - If both fire, Trigger A target wins (relieving 5h pressure is urgent); use weekly
      as a tie-break among equal-headroom candidates.
    - SHOULD_SWAP only if a valid target exists, `target != ACTIVE`, and

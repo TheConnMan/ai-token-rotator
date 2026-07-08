@@ -97,8 +97,14 @@ writing nothing). No need to stop the timer to pause.
 
 - `FIVE_HOUR_PCT` (default 80): swap when the active account's 5h utilization is
   at or above this.
-- `WEEKLY_DIVERGENCE_PCT` (default 10): swap when the spread between the highest
-  and lowest weekly utilization across accounts is at or above this.
+- `WEEKLY_DIVERGENCE_PCT` (default 10): base dead zone; swap when the spread
+  between the highest and lowest weekly utilization across accounts is at or above
+  this. The dead zone tightens adaptively as the lowest account's weekly usage (the
+  floor) climbs: to 5 when the floor is at or above 80, and to 2.5 when it is at or
+  above 90, so the rotator keeps rebalancing tightly near the weekly ceiling. The
+  floor tiers and their tightened values are configurable via
+  `WEEKLY_DIVERGENCE_HI_FLOOR` / `WEEKLY_DIVERGENCE_HI_PCT` (default 80 / 5) and
+  `WEEKLY_DIVERGENCE_VHI_FLOOR` / `WEEKLY_DIVERGENCE_VHI_PCT` (default 90 / 2.5).
 - `INTERVAL_MIN` (default 15): timer cadence in minutes.
 - `ACCOUNTS` (required): space-separated labels, one per bootstrapped account.
 
@@ -110,8 +116,10 @@ Utilization is on a 0-100 scale. On each tick:
   `FIVE_HOUR_PCT`, swap to the other account with the LOWEST 5h utilization (ties
   broken by lowest weekly).
 - Trigger B (weekly divergence): if the spread between the maximum and minimum
-  weekly utilization is at or above `WEEKLY_DIVERGENCE_PCT`, swap to the account
-  with the MINIMUM weekly utilization.
+  weekly utilization is at or above the effective dead zone, swap to the account
+  with the MINIMUM weekly utilization. The dead zone is `WEEKLY_DIVERGENCE_PCT` by
+  default, tightening to 5 when the floor (min weekly) is at or above 80 and to 2.5
+  when it is at or above 90.
 - If both trigger, Trigger A wins (relieving 5h pressure is urgent).
 
 A swap only happens if a valid target exists, it is not already the active

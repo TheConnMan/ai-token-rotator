@@ -339,6 +339,89 @@ scenario_trigger_b_below_threshold() {
     assert_cred_token "$CRED" "tok-acctA" "below-threshold live cred unchanged"
 }
 
+# Adaptive dead zone (80 tier): when the FLOOR (min known weekly) >= 80, the
+# Trigger B dead zone tightens from the base 20 to 5. floor=85 => zone 5; the
+# spread 92-85=7 >= 5 => SWAP to the min-weekly acctB. Under the flat base 20 a
+# spread of 7 would HOLD, so this FAILS today and passes after the adaptive fix.
+scenario_trigger_b_tighten_at_80_fires() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    # 5h all low (no A). floor=85 => zone 5. spread 92-85=7 >= 5 => B fires.
+    make_mock "$MOCK" "tok-acctA" 10 92
+    make_mock "$MOCK" "tok-acctB" 10 85
+
+    run_rotate
+    assert_exit 0 "$RC" "tighten-at-80 exits 0"
+    assert_eq "acctB" "$(active_label)" "tighten-at-80 swaps to min-weekly (acctB)"
+    assert_cred_token "$CRED" "tok-acctB" "tighten-at-80 live cred is acctB"
+}
+
+# Adaptive dead zone (80 tier), below the tightened threshold: floor=85 => zone 5,
+# spread 88-85=3 < 5 => HOLD. Holding is current behavior too (base 20 also holds),
+# so this PASSES today and after the fix.
+scenario_trigger_b_holds_within_80_tier() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    # floor=85 => zone 5. spread 88-85=3 < 5 => HOLD.
+    make_mock "$MOCK" "tok-acctA" 10 88
+    make_mock "$MOCK" "tok-acctB" 10 85
+
+    run_rotate
+    assert_exit 0 "$RC" "holds-within-80 exits 0"
+    assert_eq "acctA" "$(active_label)" "holds-within-80 active unchanged"
+    assert_cred_token "$CRED" "tok-acctA" "holds-within-80 live cred unchanged"
+}
+
+# Adaptive dead zone (90 tier): floor >= 90 tightens the dead zone to 2.5.
+# floor=95 => zone 2.5; spread 98-95=3 >= 2.5 => SWAP to min-weekly acctB.
+# Discriminates the 90 tier from the 80 tier: at floor 85 a spread of 3 HELD
+# (holds-within-80), here at floor 95 the same spread of 3 FIRES. Under the flat
+# base 20 this holds, so it FAILS today and passes after the adaptive fix.
+scenario_trigger_b_tighten_at_90_fires() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    # floor=95 => zone 2.5. spread 98-95=3 >= 2.5 => B fires.
+    make_mock "$MOCK" "tok-acctA" 10 98
+    make_mock "$MOCK" "tok-acctB" 10 95
+
+    run_rotate
+    assert_exit 0 "$RC" "tighten-at-90 exits 0"
+    assert_eq "acctB" "$(active_label)" "tighten-at-90 swaps to min-weekly (acctB)"
+    assert_cred_token "$CRED" "tok-acctB" "tighten-at-90 live cred is acctB"
+}
+
+# Adaptive dead zone (90 tier), below the tightened threshold: floor=95 => zone 2.5,
+# spread 97-95=2 < 2.5 => HOLD. Holding is current behavior too, so this PASSES
+# today and after the fix.
+scenario_trigger_b_holds_within_90_tier() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    # floor=95 => zone 2.5. spread 97-95=2 < 2.5 => HOLD.
+    make_mock "$MOCK" "tok-acctA" 10 97
+    make_mock "$MOCK" "tok-acctB" 10 95
+
+    run_rotate
+    assert_exit 0 "$RC" "holds-within-90 exits 0"
+    assert_eq "acctA" "$(active_label)" "holds-within-90 active unchanged"
+    assert_cred_token "$CRED" "tok-acctA" "holds-within-90 live cred unchanged"
+}
+
 # Both triggers fire => Trigger A's target wins.
 scenario_both_triggers_a_priority() {
     make_config "$CONFIG" "acctA acctB acctC"
@@ -944,6 +1027,10 @@ run_scenario "N=1 monitored no-op, never swaps"                scenario_single_a
 run_scenario "Trigger A swaps to lowest-5h other (of 3)"       scenario_trigger_a_lowest_of_three
 run_scenario "Trigger B swaps to min-weekly"                   scenario_trigger_b_min_weekly
 run_scenario "Trigger B below threshold => no swap"            scenario_trigger_b_below_threshold
+run_scenario "Trigger B adaptive: tightens at floor 80, fires" scenario_trigger_b_tighten_at_80_fires
+run_scenario "Trigger B adaptive: holds within 80 tier"        scenario_trigger_b_holds_within_80_tier
+run_scenario "Trigger B adaptive: tightens at floor 90, fires" scenario_trigger_b_tighten_at_90_fires
+run_scenario "Trigger B adaptive: holds within 90 tier"        scenario_trigger_b_holds_within_90_tier
 run_scenario "Both triggers => A target wins"                  scenario_both_triggers_a_priority
 run_scenario "Trigger B skips 5h-pressured min-weekly target"  scenario_weekly_rebalance_skips_pressured_target
 run_scenario "No flap while active-5h stays pressured"         scenario_no_flap_while_5h_pressured
