@@ -422,6 +422,30 @@ scenario_trigger_b_holds_within_90_tier() {
     assert_cred_token "$CRED" "tok-acctA" "holds-within-90 live cred unchanged"
 }
 
+# Adaptive dead zone must only ever TIGHTEN below the base, never widen above it.
+# With a low base (WEEKLY_DIVERGENCE_PCT=2) and default tiers (hp=5, vp=2.5), the
+# floor-80 tier value 5 is LARGER than the base, so it must NOT apply. floor=85,
+# spread 88-85=3 >= base 2 => SWAP to min-weekly acctB. Under the widening bug the
+# tier would raise the zone to 5, spread 3 < 5 => HOLD, so this FAILS before the fix.
+scenario_trigger_b_low_base_not_widened() {
+    make_config "$CONFIG" "acctA acctB"
+    # Lower the base below the tier values; later assignment wins when sourced.
+    echo 'WEEKLY_DIVERGENCE_PCT=2' >> "$CONFIG"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    # floor=85 => tier-80 would widen zone to 5; fix keeps zone at base 2.
+    make_mock "$MOCK" "tok-acctA" 10 88
+    make_mock "$MOCK" "tok-acctB" 10 85
+
+    run_rotate
+    assert_exit 0 "$RC" "low-base-not-widened exits 0"
+    assert_eq "acctB" "$(active_label)" "low-base-not-widened swaps to min-weekly (acctB)"
+    assert_cred_token "$CRED" "tok-acctB" "low-base-not-widened live cred is acctB"
+}
+
 # Both triggers fire => Trigger A's target wins.
 scenario_both_triggers_a_priority() {
     make_config "$CONFIG" "acctA acctB acctC"
@@ -1031,6 +1055,7 @@ run_scenario "Trigger B adaptive: tightens at floor 80, fires" scenario_trigger_
 run_scenario "Trigger B adaptive: holds within 80 tier"        scenario_trigger_b_holds_within_80_tier
 run_scenario "Trigger B adaptive: tightens at floor 90, fires" scenario_trigger_b_tighten_at_90_fires
 run_scenario "Trigger B adaptive: holds within 90 tier"        scenario_trigger_b_holds_within_90_tier
+run_scenario "Trigger B adaptive: low base never widened"      scenario_trigger_b_low_base_not_widened
 run_scenario "Both triggers => A target wins"                  scenario_both_triggers_a_priority
 run_scenario "Trigger B skips 5h-pressured min-weekly target"  scenario_weekly_rebalance_skips_pressured_target
 run_scenario "No flap while active-5h stays pressured"         scenario_no_flap_while_5h_pressured

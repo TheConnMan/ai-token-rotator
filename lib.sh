@@ -263,11 +263,13 @@ num_eq() {
 # weekly_dead_zone <floor> - echo Trigger B's effective divergence threshold. The
 # dead zone shrinks as the lowest account's weekly usage (the floor) approaches 100,
 # so the rotator keeps rebalancing tightly near the weekly ceiling. Tiers/values are
-# config knobs; check the higher floor last so it wins.
+# config knobs. Invariant: the zone only ever TIGHTENS, never widens above the base -
+# a tier applies only when its value is smaller than the running zone, so if an
+# operator sets the base below a tier value the effective zone stays at the base.
 weekly_dead_zone() {
     awk -v m="$1" \
         -v base="${WEEKLY_DIVERGENCE_PCT}" \
         -v hf="${WEEKLY_DIVERGENCE_HI_FLOOR}"  -v hp="${WEEKLY_DIVERGENCE_HI_PCT}" \
         -v vf="${WEEKLY_DIVERGENCE_VHI_FLOOR}" -v vp="${WEEKLY_DIVERGENCE_VHI_PCT}" \
-        'BEGIN { z = base; if (m >= hf) z = hp; if (m >= vf) z = vp; print z }'
+        'BEGIN { z = base; if (m >= hf && hp < z) z = hp; if (m >= vf && vp < z) z = vp; print z }'
 }
