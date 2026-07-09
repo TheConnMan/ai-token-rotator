@@ -124,28 +124,53 @@ for label in "${ACCT_ARR[@]}"; do
     FIVE[$label]=""
     WEEK[$label]=""
     token=""
+    refresh_attempted=0
     if [ "$label" = "$ACTIVE" ]; then
+        # NEVER refresh the active account: the live client owns its refresh-token
+        # rotation and racing it could invalidate a live session. Poll with the
+        # freshest token, the live cred file's.
         if valid_cred "$CRED"; then
             token=$(jq -r '.claudeAiOauth.accessToken' "$CRED")
         fi
-    else
-        if valid_cred "$STORE/$label.json"; then
-            token=$(jq -r '.claudeAiOauth.accessToken' "$STORE/$label.json")
+    elif [ "$DRY" -eq 0 ] && token_expired "$STORE/$label.json"; then
+        # Non-active idle account with an expired stored token (live tick only):
+        # nothing refreshes an idle account, so refresh it here before polling.
+        refresh_attempted=1
+        if new_tok=$(refresh_access_token "$STORE/$label.json"); then
+            token=$new_tok
+        else
+            log "refresh failed for $label (idle token, will retry next tick)"
         fi
+    elif valid_cred "$STORE/$label.json"; then
+        # Not expired (or DRY, which must never refresh): use the stored token.
+        token=$(jq -r '.claudeAiOauth.accessToken' "$STORE/$label.json")
     fi
 
     resp=""
     [ -n "$token" ] && resp=$(fetch_usage "$token")
 
+    # Non-active, live tick: a token with a future expiresAt can still be rejected.
+    # Attempt ONE refresh + re-poll before giving up, guarded so we never refresh
+    # twice for the same account in one tick.
+    if [ "$label" != "$ACTIVE" ] && [ "$DRY" -eq 0 ] && [ "$refresh_attempted" -eq 0 ] \
+        && ! { [ -n "$resp" ] && printf '%s' "$resp" | jq -e '.five_hour' >/dev/null 2>&1; }; then
+        refresh_attempted=1
+        if new_tok=$(refresh_access_token "$STORE/$label.json"); then
+            token=$new_tok
+            resp=$(fetch_usage "$token")
+        else
+            log "refresh failed for $label (idle token, will retry next tick)"
+        fi
+    fi
+
     if [ -n "$resp" ] && printf '%s' "$resp" | jq -e '.five_hour' >/dev/null 2>&1; then
         FIVE[$label]=$(printf '%s' "$resp" | jq -r '.five_hour.utilization // empty')
         WEEK[$label]=$(printf '%s' "$resp" | jq -r '.seven_day.utilization // empty')
         [ "$DRY" -eq 0 ] && write_usage "$label" "$resp"
-    elif [ -f "$STORE/$label.usage.json" ]; then
-        # Fetch failed (401/idle token): fall back to last-known stored usage.
-        FIVE[$label]=$(jq -r '.five_hour.utilization // empty' "$STORE/$label.usage.json" 2>/dev/null)
-        WEEK[$label]=$(jq -r '.seven_day.utilization // empty' "$STORE/$label.usage.json" 2>/dev/null)
     fi
+    # No stale-usage fallback: a failed poll leaves this account UNKNOWN (empty),
+    # which never fires or is targeted by a trigger. <label>.usage.json remains an
+    # informational record only; it is never read back for a decision.
 done
 
 trigA=0
@@ -264,7 +289,11 @@ if [ "$SHOULD_SWAP" -eq 0 ]; then
             reason="pinned to ${PIN_LABEL:-<empty>} but target invalid; holding on $ACTIVE"
         fi
     elif [ "$trigA" -eq 1 ] || [ "$trigB" -eq 1 ]; then
-        reason="trigger fired but no valid target; holding on $ACTIVE"
+        if [ "$trigA" -eq 0 ] && [ "$trigB" -eq 1 ] && [ "$minEligLabel" = "$ACTIVE" ]; then
+            reason="weekly divergence but $ACTIVE is already the lowest-weekly account; holding"
+        else
+            reason="trigger fired but no valid target; holding on $ACTIVE"
+        fi
     else
         reason="no trigger"
     fi

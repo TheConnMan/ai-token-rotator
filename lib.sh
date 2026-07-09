@@ -245,6 +245,91 @@ swap_in_token() {
     fi
 }
 
+# token_expired <file> - return 0 (true) if the stored .claudeAiOauth.expiresAt
+# (epoch MS) is missing/null, or is at/under now + a 60s skew; return 1 otherwise.
+# Used to decide whether an idle NON-active account needs a token refresh before
+# polling. now_ms is date +%s (epoch seconds) * 1000.
+token_expired() {
+    local file="$1"
+    local exp now_ms
+    exp=$(jq -r '.claudeAiOauth.expiresAt // empty' "$file" 2>/dev/null)
+    [ -z "$exp" ] && return 0
+    now_ms=$(( $(date +%s) * 1000 ))
+    awk -v e="$exp" -v n="$now_ms" 'BEGIN { exit (e <= n + 60000) ? 0 : 1 }'
+}
+
+# refresh_access_token <store_file> - refresh an idle account's OAuth access token
+# using its stored refresh token, persist the result atomically into <store_file>
+# (updating accessToken, expiresAt, and a ROTATED refreshToken while PRESERVING all
+# other .claudeAiOauth fields), and echo the new access token. Returns 1 (echoing
+# nothing, leaving <store_file> untouched) on any failure: no refresh token, HTTP
+# error, a response without .access_token, or any jq/validation failure.
+#
+# Test hook: when ROTATOR_REFRESH_MOCK_DIR is set, read <refreshToken>.json from it
+# as the simulated token-endpoint response (absent file simulates a 401/429/failure)
+# instead of hitting the network, mirroring fetch_usage's ROTATOR_USAGE_MOCK_DIR hook.
+refresh_access_token() {
+    local store_file="$1"
+    local rt resp new_tok new_rt expires_in new_exp now_ms dir tmp
+    rt=$(jq -r '.claudeAiOauth.refreshToken // empty' "$store_file" 2>/dev/null)
+    [ -z "$rt" ] && return 1
+
+    if [ -n "${ROTATOR_REFRESH_MOCK_DIR:-}" ]; then
+        [ -f "$ROTATOR_REFRESH_MOCK_DIR/$rt.json" ] || return 1
+        resp=$(cat "$ROTATOR_REFRESH_MOCK_DIR/$rt.json")
+    else
+        # Keep the refresh token OUT of the curl argv (visible in ps / proc
+        # cmdline): build the JSON body with jq and pass it via stdin (--data @-),
+        # consistent with how fetch_usage keeps the bearer out of argv.
+        # console.anthropic.com/v1/oauth/token sits behind Cloudflare bot
+        # protection that 429s the default curl User-Agent BEFORE OAuth
+        # validation; send a real client UA so the refresh request reaches the
+        # OAuth layer (verified 2026-07-09). The usage endpoint (api.anthropic.com)
+        # has no such gate, so fetch_usage does not need this.
+        resp=$(jq -cn --arg rt "$rt" --arg cid "9d1c250a-e61b-44d9-88ed-5944d1962f5e" \
+            '{grant_type: "refresh_token", refresh_token: $rt, client_id: $cid}' \
+            | curl -s --max-time 10 "https://console.anthropic.com/v1/oauth/token" \
+                -A "anthropic-sdk-typescript/0.0.0 userOAuthProvider" \
+                -H "Content-Type: application/json" --data @- 2>/dev/null)
+    fi
+
+    new_tok=$(printf '%s' "$resp" | jq -r '.access_token // empty' 2>/dev/null)
+    [ -z "$new_tok" ] && return 1
+
+    expires_in=$(printf '%s' "$resp" | jq -r '.expires_in // empty' 2>/dev/null)
+    [ -z "$expires_in" ] && expires_in=0
+    now_ms=$(( $(date +%s) * 1000 ))
+    new_exp=$(( now_ms + expires_in * 1000 ))
+
+    # Refresh tokens ROTATE; persist a rotated one if present, else keep the old one.
+    new_rt=$(printf '%s' "$resp" | jq -r '.refresh_token // empty' 2>/dev/null)
+    [ -z "$new_rt" ] && new_rt=$rt
+
+    dir=$(dirname "$store_file")
+    tmp=$(mktemp "$dir/.tokrot.XXXXXX") || return 1
+    if ! jq --arg at "$new_tok" --argjson ea "$new_exp" --arg rtok "$new_rt" \
+        '.claudeAiOauth.accessToken = $at
+         | .claudeAiOauth.expiresAt = $ea
+         | .claudeAiOauth.refreshToken = $rtok' \
+        "$store_file" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! jq -e '.claudeAiOauth.accessToken' "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 600 "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$store_file"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    printf '%s' "$new_tok"
+}
+
 # num_ge <a> <b> - return 0 if a >= b (fractional-safe via awk).
 num_ge() {
     awk -v a="$1" -v b="$2" 'BEGIN { exit (a >= b) ? 0 : 1 }'

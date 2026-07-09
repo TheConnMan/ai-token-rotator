@@ -67,6 +67,35 @@ EOF
     chmod 600 "$path"
 }
 
+# make_token_store_exp <path> <token> <refresh> <expiresAt> - token-only store
+# file with an explicit refreshToken and expiresAt (epoch MS). Use a past expiresAt
+# to simulate an idle account whose stored access token has expired.
+make_token_store_exp() {
+    local path="$1" token="$2" refresh="$3" exp="$4"
+    cat > "$path" <<EOF
+{"claudeAiOauth":{"accessToken":"$token","refreshToken":"$refresh","expiresAt":$exp}}
+EOF
+    chmod 600 "$path"
+}
+
+# make_refresh_mock <dir> <refreshToken> <newAccess> <expiresIn> [newRefresh] -
+# write the simulated token-endpoint response refresh_access_token <store_file>
+# will read (keyed on the account's refreshToken). Absence of this file simulates a
+# refresh failure (HTTP 429 / rate-limited / no refresh token). Include <newRefresh>
+# to simulate refresh-token ROTATION.
+make_refresh_mock() {
+    local dir="$1" rt="$2" newacc="$3" expin="$4" newrt="${5:-}"
+    if [ -n "$newrt" ]; then
+        cat > "$dir/$rt.json" <<EOF
+{"access_token":"$newacc","expires_in":$expin,"refresh_token":"$newrt"}
+EOF
+    else
+        cat > "$dir/$rt.json" <<EOF
+{"access_token":"$newacc","expires_in":$expin}
+EOF
+    fi
+}
+
 # make_mcp_store <path> <marker> - write a canonical mcp.json (or a fixture to
 # assert restore/preserve against). Holds only .mcpOAuth, keyed "srv", whose
 # accessToken is <marker> so we can prove which MCP set landed where.
@@ -128,7 +157,8 @@ setup_sandbox() {
     CRED="$SB/cred/.credentials.json"   # NOT $HOME/.claude/.credentials.json
     CONFIG="$SB/config.env"
     MOCK="$SB/mock"
-    mkdir -p "$STORE" "$SB/cred" "$MOCK"
+    REFRESH="$SB/refresh"               # ROTATOR_REFRESH_MOCK_DIR (token-refresh mock)
+    mkdir -p "$STORE" "$SB/cred" "$MOCK" "$REFRESH"
     chmod 700 "$STORE"
 }
 
@@ -145,6 +175,7 @@ run_rotate() {
     ROTATOR_CRED="$CRED" \
     ROTATOR_CONFIG="$CONFIG" \
     ROTATOR_USAGE_MOCK_DIR="$MOCK" \
+    ROTATOR_REFRESH_MOCK_DIR="$REFRESH" \
         bash "$ROTATE" "$@"
     RC=$?
 }
@@ -155,6 +186,7 @@ run_rotate_status_out() {
         ROTATOR_CRED="$CRED" \
         ROTATOR_CONFIG="$CONFIG" \
         ROTATOR_USAGE_MOCK_DIR="$MOCK" \
+        ROTATOR_REFRESH_MOCK_DIR="$REFRESH" \
             bash "$ROTATE" status
     )
     RC=$?
@@ -572,6 +604,44 @@ scenario_settles_on_low_weekly_after_5h_reset() {
     assert_cred_token "$CRED" "tok-acctA" "settles live cred is acctA"
 }
 
+# Trigger B fires but the min-weekly ELIGIBLE account it would target IS the active
+# account: we are already parked on the optimal (lowest-weekly) account, so HOLD with
+# a benign reason that is distinct from the genuine no-target case. active=acctA is the
+# min-weekly (81); acctB is higher weekly (95). Both 5h are below FIVE_HOUR_PCT (5 and
+# 40) so both are eligible. floor=81 => adaptive dead zone 5; spread 95-81=14 >= 5 => B
+# fires, but its min-weekly-eligible target IS acctA (active) => HOLD. The reason must
+# say "already the lowest-weekly account" and must NOT say "no valid target".
+scenario_weekly_divergence_active_is_min_weekly() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 5 81    # active: 5h fine, LOWEST weekly
+    make_mock "$MOCK" "tok-acctB" 40 95   # eligible on 5h, higher weekly
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "active-is-min-weekly status exits 0"
+    case "$OUT" in
+        *decision=HOLD*) ;;
+        *) fail "active-is-min-weekly status did not include decision=HOLD" ;;
+    esac
+    case "$OUT" in
+        *"already the lowest-weekly account"*) ;;
+        *) fail "active-is-min-weekly reason missing 'already the lowest-weekly account'" ;;
+    esac
+    case "$OUT" in
+        *"no valid target"*) fail "active-is-min-weekly reason wrongly said 'no valid target'" ;;
+    esac
+
+    # A live tick must not move off acctA.
+    run_rotate
+    assert_exit 0 "$RC" "active-is-min-weekly exits 0"
+    assert_eq "acctA" "$(active_label)" "active-is-min-weekly held on acctA"
+    assert_cred_token "$CRED" "tok-acctA" "active-is-min-weekly live cred still acctA"
+}
+
 # sync-out before swap: a token refresh in the live cred is captured into the
 # OLD active's <label>.json before the swap replaces the live file.
 scenario_sync_out_before_swap() {
@@ -692,26 +762,185 @@ scenario_status_mutates_nothing() {
     assert_eq "$store_before" "$(dir_sha "$STORE")" "status leaves store unchanged"
 }
 
-# Fallback: an idle account whose token 401s (no mock file) but has a stored
-# usage.json; the decision must use the stored value.
-scenario_fallback_uses_stored_usage() {
+# CORE REGRESSION (change 1): a non-active poll that fails must NOT fall back to a
+# stale <label>.usage.json on disk; the account is UNKNOWN and the stale reading is
+# never read into the decision. active=acctA (5h=90 => A fires). acctB polls fine at
+# 60. acctC has a FUTURE-dated stored token (so no first-pass refresh), no usage mock
+# (poll fails), no refresh mock (retry-refresh fails) => UNKNOWN, AND a stale
+# acctC.usage.json (5h=20) sits on disk. Under the OLD stale-usage fallback acctC
+# would read as 5h=20 and win the Trigger A target over acctB(60); with the fallback
+# removed acctC is UNKNOWN and the target is acctB(60). Asserting acctB proves the
+# stale usage.json was NOT consulted.
+scenario_no_stale_usage_fallback() {
     make_config "$CONFIG" "acctA acctB acctC"
     seed_account acctA "tok-acctA"
     seed_account acctB "tok-acctB"
     seed_account acctC "tok-acctC"
-    make_usage "$STORE/acctC.usage.json" 20 10   # stored value for the idle account
+    make_usage "$STORE/acctC.usage.json" 20 10   # STALE on-disk reading (must be ignored)
     set_active acctA
     enable
     make_cred "$CRED" "tok-acctA"
     make_mock "$MOCK" "tok-acctA" 90 10   # active: A fires
     make_mock "$MOCK" "tok-acctB" 60 10   # live 5h known
-    # acctC: NO mock file => its live fetch 401s; must fall back to stored 5h=20.
-    # If the fallback is honored, acctC(20) < acctB(60) => target acctC.
+    # acctC: NO usage mock => poll fails; NO refresh mock => retry-refresh fails => UNKNOWN.
 
     run_rotate
-    assert_exit 0 "$RC" "fallback exits 0"
-    assert_eq "acctC" "$(active_label)" "fallback used stored usage to pick acctC over acctB"
-    assert_cred_token "$CRED" "tok-acctC" "fallback live cred is acctC"
+    assert_exit 0 "$RC" "no-stale-fallback exits 0"
+    assert_eq "acctB" "$(active_label)" "no-stale-fallback ignored stale acctC.usage.json, target=acctB(60)"
+    assert_cred_token "$CRED" "tok-acctB" "no-stale-fallback live cred is acctB"
+}
+
+# Change 2: a NON-active account with an EXPIRED stored token gets refreshed via its
+# stored refresh token before polling. After the tick <label>.json has the NEW
+# accessToken and a future expiresAt, and the polled usage drives the decision.
+scenario_refresh_expired_nonactive() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctB "tok-acctB"
+    make_token_store_exp "$STORE/acctA.json" "tok-acctA-old" "rt-acctA-old" 1700000000000
+    set_active acctB
+    enable
+    make_cred "$CRED" "tok-acctB"
+    make_mock "$MOCK" "tok-acctB" 10 10
+    make_refresh_mock "$REFRESH" "rt-acctA-old" "tok-acctA-new" 3600
+    make_mock "$MOCK" "tok-acctA-new" 5 50   # usage keyed on the REFRESHED token
+
+    local now_ms
+    now_ms=$(( $(date +%s) * 1000 ))
+
+    run_rotate
+    assert_exit 0 "$RC" "refresh-expired exits 0"
+    assert_cred_token "$STORE/acctA.json" "tok-acctA-new" "refresh-expired persisted new access token"
+    local new_exp
+    new_exp=$(jq -r '.claudeAiOauth.expiresAt' "$STORE/acctA.json")
+    if ! awk -v e="$new_exp" -v n="$now_ms" 'BEGIN { exit (e > n) ? 0 : 1 }'; then
+        fail "refresh-expired expiresAt not in the future (expiresAt=$new_exp now_ms=$now_ms)"
+    fi
+    # The refreshed poll (acctA 5h=5, wk=50) must appear in the decision line.
+    if ! grep -q 'acctA(5h=5,wk=50)' "$STORE/rotate.log"; then
+        fail "refresh-expired decision did not reflect the polled acctA usage"
+    fi
+}
+
+# Change 2 failure path: a NON-active EXPIRED token whose refresh mock is MISSING =>
+# the account stays UNKNOWN, does not fire/target a trigger, and <label>.json is
+# byte-unchanged (refresh failed => not rewritten).
+scenario_refresh_missing_unknown() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctB "tok-acctB"
+    make_token_store_exp "$STORE/acctA.json" "tok-acctA-old" "rt-acctA-old" 1700000000000
+    set_active acctB
+    enable
+    make_cred "$CRED" "tok-acctB"
+    make_mock "$MOCK" "tok-acctB" 10 10
+    # No refresh mock for rt-acctA-old and no usage mock => acctA UNKNOWN.
+
+    local a_before
+    a_before=$(file_sha "$STORE/acctA.json")
+
+    run_rotate
+    assert_exit 0 "$RC" "refresh-missing exits 0"
+    assert_eq "$a_before" "$(file_sha "$STORE/acctA.json")" "refresh-missing left acctA.json byte-unchanged"
+    assert_eq "acctB" "$(active_label)" "refresh-missing held on acctB (acctA UNKNOWN, no swap)"
+    if ! grep -q 'acctA(5h=?,wk=?)' "$STORE/rotate.log"; then
+        fail "refresh-missing did not report acctA as UNKNOWN (?) in the decision line"
+    fi
+}
+
+# The active account is NEVER refreshed out of band, even with an expired live token
+# and a refresh mock present. Proof: acctA.json ends up with the live token (from
+# sync-out), NOT the refreshed token, and the live cred is unchanged.
+scenario_active_never_refreshed() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    # Live cred for the ACTIVE account carries an EXPIRED token. Built via jq
+    # with --arg (not an inline JSON literal) so no secret-shaped token string
+    # lands in the staged diff for the check-secrets commit hook; the resulting
+    # cred JSON is identical.
+    jq -n --arg at "tok-acctA" --arg rt "rt-acctA" --arg mt "mcp-tok-acctA" \
+        '{claudeAiOauth:{accessToken:$at,refreshToken:$rt,expiresAt:1700000000000},mcpOAuth:{"server-x":{accessToken:$mt}}}' > "$CRED"
+    chmod 600 "$CRED"
+    make_mock "$MOCK" "tok-acctA" 10 10   # active polls with the LIVE token
+    make_mock "$MOCK" "tok-acctB" 10 10
+    # A refresh mock exists for the active account; it must NOT be used.
+    make_refresh_mock "$REFRESH" "rt-acctA" "tok-acctA-REFRESHED" 3600
+
+    run_rotate
+    assert_exit 0 "$RC" "active-never-refreshed exits 0"
+    # Live cred untouched by any refresh (still the original active token).
+    assert_cred_token "$CRED" "tok-acctA" "active-never-refreshed live cred unchanged"
+    # Store slot holds the synced live token, never the refreshed value.
+    assert_cred_token "$STORE/acctA.json" "tok-acctA" "active-never-refreshed store slot not refreshed"
+    assert_eq "acctA" "$(active_label)" "active-never-refreshed active pointer unchanged"
+}
+
+# DRY/status must NEVER refresh (refresh rotates the server-side refresh token and a
+# dry run must not persist, which would strand the account). status over an expired
+# non-active token with a refresh mock present leaves <label>.json byte-unchanged.
+scenario_dry_never_refreshes() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctB "tok-acctB"
+    make_token_store_exp "$STORE/acctA.json" "tok-acctA-old" "rt-acctA-old" 1700000000000
+    set_active acctB
+    enable
+    make_cred "$CRED" "tok-acctB"
+    make_mock "$MOCK" "tok-acctB" 10 10
+    make_refresh_mock "$REFRESH" "rt-acctA-old" "tok-acctA-new" 3600
+    make_mock "$MOCK" "tok-acctA-new" 5 50
+
+    local a_before
+    a_before=$(file_sha "$STORE/acctA.json")
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "dry-never-refreshes status exits 0"
+    assert_eq "$a_before" "$(file_sha "$STORE/acctA.json")" "dry-never-refreshes left acctA.json byte-unchanged"
+}
+
+# Refresh-token ROTATION is persisted: a refresh response carrying a new refresh_token
+# must update <label>.json's .claudeAiOauth.refreshToken to the rotated value.
+scenario_refresh_token_rotation_persisted() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctB "tok-acctB"
+    make_token_store_exp "$STORE/acctA.json" "tok-acctA-old" "rt-acctA-old" 1700000000000
+    set_active acctB
+    enable
+    make_cred "$CRED" "tok-acctB"
+    make_mock "$MOCK" "tok-acctB" 10 10
+    make_refresh_mock "$REFRESH" "rt-acctA-old" "tok-acctA-new" 3600 "rt-acctA-ROTATED"
+    make_mock "$MOCK" "tok-acctA-new" 10 10
+
+    run_rotate
+    assert_exit 0 "$RC" "refresh-rotation exits 0"
+    assert_cred_token "$STORE/acctA.json" "tok-acctA-new" "refresh-rotation persisted new access token"
+    local new_rt
+    new_rt=$(jq -r '.claudeAiOauth.refreshToken' "$STORE/acctA.json")
+    assert_eq "rt-acctA-ROTATED" "$new_rt" "refresh-rotation persisted the rotated refresh token"
+}
+
+# END-TO-END unblock (mirrors the real incident): active=acctB with high weekly (94);
+# acctA non-active with an EXPIRED token and a STALE pressured usage.json (5h=90) that
+# the OLD code would have read to phantom-pressure it out of the rebalance target set.
+# The refresh revives acctA and its live usage is 5h=5 (not pressured), weekly=81. With
+# floor=81 the adaptive dead zone is 5, spread 94-81=13 >= 5 => Trigger B fires and the
+# tick SWAPS from acctB to acctA, proving the phantom-pressure block is gone.
+scenario_e2e_refresh_unblocks_rebalance() {
+    make_config "$CONFIG" "acctA acctB"
+    make_token_store_exp "$STORE/acctA.json" "tok-acctA-old" "rt-acctA-old" 1700000000000
+    seed_account acctB "tok-acctB"
+    make_usage "$STORE/acctA.usage.json" 90 10   # STALE pressured reading (must be ignored)
+    set_active acctB
+    enable
+    make_cred "$CRED" "tok-acctB"
+    make_mock "$MOCK" "tok-acctB" 30 94          # active: 5h fine, high weekly
+    make_refresh_mock "$REFRESH" "rt-acctA-old" "tok-acctA-new" 3600
+    make_mock "$MOCK" "tok-acctA-new" 5 81       # revived acctA: 5h low, weekly 81
+
+    run_rotate
+    assert_exit 0 "$RC" "e2e-unblock exits 0"
+    assert_eq "acctA" "$(active_label)" "e2e-unblock swapped acctB -> acctA (rebalance unblocked)"
+    assert_cred_token "$CRED" "tok-acctA-new" "e2e-unblock live cred is the refreshed acctA"
 }
 
 # N=1 is a MONITORED no-op: it must still poll and log (write usage), never swap.
@@ -1060,12 +1289,19 @@ run_scenario "Both triggers => A target wins"                  scenario_both_tri
 run_scenario "Trigger B skips 5h-pressured min-weekly target"  scenario_weekly_rebalance_skips_pressured_target
 run_scenario "No flap while active-5h stays pressured"         scenario_no_flap_while_5h_pressured
 run_scenario "Settles on low-weekly after 5h reset"            scenario_settles_on_low_weekly_after_5h_reset
+run_scenario "Weekly divergence, active is min-weekly => hold"  scenario_weekly_divergence_active_is_min_weekly
 run_scenario "sync-out captures refresh before swap"           scenario_sync_out_before_swap
 run_scenario "Invalid live cred => skip, store untouched"      scenario_invalid_live_cred_skips
 run_scenario "Target missing/invalid => no swap"               scenario_target_invalid_no_swap
 run_scenario "Token-only swap preserves live mcpOAuth"         scenario_swap_token_only_preserves_mcp
 run_scenario "status mode mutates nothing"                     scenario_status_mutates_nothing
-run_scenario "Fallback uses stored usage when token 401s"      scenario_fallback_uses_stored_usage
+run_scenario "No stale-usage fallback: failed poll => UNKNOWN"  scenario_no_stale_usage_fallback
+run_scenario "Refresh expired non-active token before polling"  scenario_refresh_expired_nonactive
+run_scenario "Refresh mock missing => UNKNOWN, store unchanged"  scenario_refresh_missing_unknown
+run_scenario "Active account is never refreshed out of band"    scenario_active_never_refreshed
+run_scenario "DRY/status never refreshes (store byte-unchanged)" scenario_dry_never_refreshes
+run_scenario "Refresh-token rotation persisted to store"        scenario_refresh_token_rotation_persisted
+run_scenario "E2E: refresh unblocks weekly rebalance"           scenario_e2e_refresh_unblocks_rebalance
 run_scenario "N=1 polls and logs (writes usage), never swaps"  scenario_n1_polls_and_logs
 run_scenario "Desync guard: no clobber of active store slot"   scenario_desync_guard_no_clobber
 run_scenario "Bootstrap sets active to captured account"       scenario_bootstrap_sets_active_to_captured

@@ -24,9 +24,14 @@ second account is bootstrapped.
   validate the temp has `.claudeAiOauth.accessToken`, and rename over the live file.
   ABORT rather than write if the result would be invalid, so the live file is never
   torn and never invalid.
-- Access token lifetime is about 6h and is auto-refreshed by the active process
-  (which rewrites the file). An idle account is frozen: nothing refreshes it, so its
-  stored copy stays valid and refreshes on first use when swapped back in.
+- Access token lifetime is about 6h. The ACTIVE account is auto-refreshed by the
+  live Claude client (which rewrites the credentials file); the rotator never
+  refreshes the active account out of band. Idle NON-active accounts are no longer
+  frozen: on a LIVE tick the rotator refreshes an idle account's stored token via its
+  stored refresh token before polling that account's usage, so an idle account's
+  usage stays observable and its slot stays valid for a later swap-in. DRY/status
+  never refreshes (refresh rotates the server-side refresh token and must not persist
+  on a dry run).
 - The access token is opaque (not a JWT), so there is no embedded account identity.
   The active account is tracked by an `active` pointer file.
 - Do NOT use a symlink for `.credentials.json`. Claude's atomic refresh-write
@@ -100,9 +105,16 @@ Default is the tick. `status` is a dry read-out: compute and print, never write 
    (do not proceed to swap).
 5. poll usage for EVERY account: use each account's stored accessToken (ACTIVE uses
    the live file, which is freshest). On success update `<label>.usage.json` (skip
-   write if DRY). On 401/failure (idle token expired), fall back to that label's last
-   `<label>.usage.json`; treat a missing weekly as unknown (exclude from min /
-   divergence), and never let an unknown value fire a trigger.
+   write if DRY). On a failed poll of a NON-active account (idle token expired or
+   rejected), in LIVE mode only, refresh that account's stored token via its stored
+   refresh token and retry the poll once (never refresh twice for one account in one
+   tick). If the refresh or the retried poll still fails, the value is UNKNOWN: there
+   is NO stale-usage fallback, so a stale `<label>.usage.json` is never read into a
+   decision (it stays only as an informational record). The ACTIVE account is never
+   refreshed out of band (the live client owns its refresh-token rotation), and
+   DRY/status never refreshes. Treat a missing/unknown weekly as unknown (exclude
+   from min / divergence), and never let an unknown value fire or be targeted by a
+   trigger.
 6. decide:
    - Trigger A (5h pressure): ACTIVE `five_hour.utilization >= FIVE_HOUR_PCT`.
      Target = the account other than ACTIVE with the LOWEST `five_hour.utilization`.
@@ -140,6 +152,20 @@ exists. Do NOT create `ENABLED`.
 chmod 600 + `mv -f`), `valid_cred(path)` (`jq -e '.claudeAiOauth.accessToken'`),
 ACCOUNTS parsing, usage-json read/write. Honor `ROTATOR_CRED` / `ROTATOR_STORE`.
 
+Refresh helpers (for the idle-account refresh path):
+- `token_expired(file)` return 0 (true) iff `.claudeAiOauth.expiresAt` (epoch MS) is
+  missing/null or is at/under `now_ms + 60000` (60s skew); now_ms is `date +%s` * 1000.
+- `refresh_access_token(store_file)` POST the stored `.claudeAiOauth.refreshToken` to
+  `https://console.anthropic.com/v1/oauth/token` (`grant_type=refresh_token`, the
+  known client_id), body via stdin (`--data @-`, keeping the refresh token out of
+  argv). On success (response has `.access_token`) atomically rewrite `store_file`'s
+  `.claudeAiOauth` accessToken, expiresAt (`now_ms + expires_in*1000`), and refreshToken
+  (persisting a ROTATED one, else keeping the existing), preserving all other fields;
+  echo the new access token, return 0. Any failure => return 1, echo nothing,
+  `store_file` untouched. Test hook: `ROTATOR_REFRESH_MOCK_DIR` reads
+  `<refreshToken>.json` from that dir as the simulated response (absent => failure),
+  mirroring `fetch_usage`'s `ROTATOR_USAGE_MOCK_DIR`.
+
 Token-only helpers (all atomic: temp in the destination dir + chmod 600 + `mv -f`):
 - `capture_token(cred,dst)`  write `{"claudeAiOauth": (cred.claudeAiOauth)}` to `<label>.json`.
 - `capture_mcp(cred,dst)`    grow-merge the live `.mcpOAuth` into `mcp.json` (`dst.mcpOAuth * cred.mcpOAuth`, so live refreshes overlapping server tokens while canonical-only servers are preserved); first capture writes the live set as-is; no-op if the live MCP set is empty.
@@ -172,9 +198,10 @@ Token-only helpers (all atomic: temp in the destination dir + chmod 600 + `mv -f
 
 ## Tests (test-first, bats or plain-bash asserts)
 
-Use a temp `ROTATOR_STORE` and temp `ROTATOR_CRED` (fixtures), and a stubbed
-`fetch_usage` (inject usage JSON via env or a mock function) so decisions are
-deterministic. NEVER touch the real `~/.claude`. Cover:
+Use a temp `ROTATOR_STORE` and temp `ROTATOR_CRED` (fixtures), a stubbed
+`fetch_usage` (`ROTATOR_USAGE_MOCK_DIR`), and a stubbed token refresh
+(`ROTATOR_REFRESH_MOCK_DIR`) so decisions are deterministic. NEVER touch the real
+`~/.claude`. Cover:
 - ENABLED gate absent => exit 0, no writes; cred fixture byte-identical (sha256).
 - N=1 never swaps regardless of usage.
 - Trigger A: active 5h >= threshold => swaps to lowest-5h other; correct target among 3.
@@ -188,7 +215,21 @@ deterministic. NEVER touch the real `~/.claude`. Cover:
 - bootstrap captures a token-only `<label>.json` plus the canonical `mcp.json`, and
   restores the shared MCP set into the live cred after a `/login` wipe.
 - `status` mode mutates nothing.
-Mock ONLY the external usage HTTP call (and the clock if needed). Do NOT mock file ops.
+- Non-active EXPIRED token + refresh mock present => the account is refreshed before
+  polling; `<label>.json` gets the new accessToken + a future expiresAt and the polled
+  usage drives the decision.
+- Non-active EXPIRED token + refresh mock MISSING => the account is UNKNOWN, fires/targets
+  no trigger, and `<label>.json` is byte-unchanged.
+- Non-active failed poll with a stale `<label>.usage.json` on disk => the account is
+  UNKNOWN; the stale usage is NOT read into the decision (no stale-usage fallback).
+- The ACTIVE account is never refreshed out of band even with an expired live token and
+  a refresh mock present.
+- DRY/status never refreshes: `status` over an expired non-active token leaves
+  `<label>.json` byte-unchanged.
+- Refresh-token rotation is persisted: a rotated `refresh_token` in the response updates
+  `<label>.json`'s refreshToken.
+Mock ONLY the external usage + token-refresh HTTP calls (and the clock if needed). Do
+NOT mock file ops.
 
 ## Done when
 
