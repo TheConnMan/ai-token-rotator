@@ -33,6 +33,7 @@ Description=Run the Claude Code token rotator on a timer
 
 [Timer]
 OnBootSec=5min
+OnActiveSec=1min
 OnUnitActiveSec=${INTERVAL_MIN}min
 Persistent=true
 
