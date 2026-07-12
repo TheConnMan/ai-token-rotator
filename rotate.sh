@@ -125,11 +125,21 @@ for label in "${ACCT_ARR[@]}"; do
     WEEK[$label]=""
     token=""
     refresh_attempted=0
+    resp=""
+    used_mirror=0
     if [ "$label" = "$ACTIVE" ]; then
-        # NEVER refresh the active account: the live client owns its refresh-token
-        # rotation and racing it could invalidate a live session. Poll with the
-        # freshest token, the live cred file's.
-        if valid_cred "$CRED"; then
+        # Prefer a fresh, identity-matched statusline mirror over polling: it
+        # reuses the reading the live session already has, avoids a redundant hit
+        # on the token most likely to be rate-limited, and stays informed even
+        # while oauth/usage is 429ing the active token. Empty unless the mirror is
+        # fresh AND provably the active account (see read_active_mirror).
+        resp=$(read_active_mirror "$ACTIVE")
+        if [ -n "$resp" ]; then
+            used_mirror=1
+        elif valid_cred "$CRED"; then
+            # NEVER refresh the active account: the live client owns its refresh-token
+            # rotation and racing it could invalidate a live session. Poll with the
+            # freshest token, the live cred file's.
             token=$(jq -r '.claudeAiOauth.accessToken' "$CRED")
         fi
     elif [ "$DRY" -eq 0 ] && token_expired "$STORE/$label.json"; then
@@ -146,8 +156,10 @@ for label in "${ACCT_ARR[@]}"; do
         token=$(jq -r '.claudeAiOauth.accessToken' "$STORE/$label.json")
     fi
 
-    resp=""
-    [ -n "$token" ] && resp=$(fetch_usage "$token")
+    # Poll only if the mirror did not already supply the active account's reading.
+    [ -z "$resp" ] && [ -n "$token" ] && resp=$(fetch_usage "$token")
+    [ "$used_mirror" -eq 1 ] && [ "$DRY" -eq 0 ] \
+        && log "active $ACTIVE usage from statusline mirror; skipped endpoint poll"
 
     # Non-active, live tick: a token with a future expiresAt can still be rejected.
     # Attempt ONE refresh + re-poll before giving up, guarded so we never refresh

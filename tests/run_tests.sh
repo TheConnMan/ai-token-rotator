@@ -135,6 +135,24 @@ make_mock() {
 EOF
 }
 
+# make_mirror <path> <five_pct> <weekly_pct> <weekly_reset_epoch> [age_secs] - write
+# the statusline usage mirror (/tmp/claude-usage-starship.json shape). The rotator
+# only trusts it for the ACTIVE account when it is fresh AND its seven_day_reset
+# matches the active account's stored weekly reset. Pass age_secs to backdate the
+# file mtime (simulating a stale mirror); default is fresh (now).
+make_mirror() {
+    local path="$1" p5="$2" p7="$3" wreset="$4" age="${5:-0}"
+    printf '{"five_hour_pct":%s,"five_hour_reset":0,"seven_day_pct":%s,"seven_day_reset":%s}\n' \
+        "$p5" "$p7" "$wreset" > "$path"
+    if [ "$age" -gt 0 ]; then
+        touch -d "@$(( $(date +%s) - age ))" "$path"
+    fi
+}
+
+# Epoch of the weekly reset make_usage stamps, so a mirror can be made to match
+# (or, by using a different value, deliberately mismatch) the active account's anchor.
+WK_RESET_EPOCH=$(date -d '2099-01-08T00:00:00Z' +%s)
+
 # make_config <path> <accounts> - write a config.env. Thresholds are pinned for
 # scenario determinism (FIVE_HOUR_PCT=80, WEEKLY_DIVERGENCE_PCT=20); the divergence
 # mocks below are calibrated to a 20 threshold, so this pin is intentional and does
@@ -158,6 +176,7 @@ setup_sandbox() {
     CONFIG="$SB/config.env"
     MOCK="$SB/mock"
     REFRESH="$SB/refresh"               # ROTATOR_REFRESH_MOCK_DIR (token-refresh mock)
+    MIRROR_FILE="$SB/starship.json"     # ROTATOR_MIRROR_FILE (statusline usage mirror; ABSENT unless a scenario writes it)
     mkdir -p "$STORE" "$SB/cred" "$MOCK" "$REFRESH"
     chmod 700 "$STORE"
 }
@@ -176,6 +195,7 @@ run_rotate() {
     ROTATOR_CONFIG="$CONFIG" \
     ROTATOR_USAGE_MOCK_DIR="$MOCK" \
     ROTATOR_REFRESH_MOCK_DIR="$REFRESH" \
+    ROTATOR_MIRROR_FILE="$MIRROR_FILE" \
         bash "$ROTATE" "$@"
     RC=$?
 }
@@ -187,6 +207,7 @@ run_rotate_status_out() {
         ROTATOR_CONFIG="$CONFIG" \
         ROTATOR_USAGE_MOCK_DIR="$MOCK" \
         ROTATOR_REFRESH_MOCK_DIR="$REFRESH" \
+        ROTATOR_MIRROR_FILE="$MIRROR_FILE" \
             bash "$ROTATE" status
     )
     RC=$?
@@ -790,6 +811,109 @@ scenario_no_stale_usage_fallback() {
     assert_cred_token "$CRED" "tok-acctB" "no-stale-fallback live cred is acctB"
 }
 
+# Statusline mirror: the ACTIVE account's usage may come from the fresh, identity-
+# matched statusline mirror instead of a fresh oauth/usage poll. This reuses the
+# reading the live session already has and, crucially, keeps the rotator informed
+# even when the active token is being rate-limited at the usage endpoint.
+
+# INCIDENT FIX: active endpoint is unpollable (429 => no mock), but a fresh,
+# reset-matched mirror supplies the reading, so Trigger B still fires and swaps.
+scenario_mirror_supplies_reading_when_endpoint_unpollable() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    make_usage "$STORE/acctA.usage.json" 99 99   # anchor: weekly reset 2099-01-08; utils here are IGNORED
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    # NO mock for tok-acctA => the active endpoint poll would fail (simulates 429).
+    make_mock "$MOCK" "tok-acctB" 0 0            # idle acctB pollable, low weekly
+    make_mirror "$MIRROR_FILE" 13 46 "$WK_RESET_EPOCH"   # fresh, reset MATCHES acctA anchor
+
+    run_rotate
+    assert_exit 0 "$RC" "mirror-incident exits 0"
+    assert_eq "acctB" "$(active_label)" "mirror supplied acctA weekly=46 => Trigger B swaps to acctB despite unpollable endpoint"
+    assert_cred_token "$CRED" "tok-acctB" "mirror-incident live cred is acctB"
+}
+
+# Mirror is PREFERRED over an available endpoint (poll is skipped). Mirror shows a
+# quiet account; the endpoint mock (if wrongly consulted) would fire Trigger A.
+# Correct behavior HOLDs on acctA; a poll would have swapped it away.
+scenario_mirror_preferred_skips_poll() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    make_usage "$STORE/acctA.usage.json" 0 5     # anchor reset 2099-01-08
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 5           # endpoint would say 5h=90 (Trigger A) -- must be ignored
+    make_mock "$MOCK" "tok-acctB" 0 5            # no weekly divergence
+    make_mirror "$MIRROR_FILE" 13 5 "$WK_RESET_EPOCH"   # fresh + match: 5h=13 (no Trigger A), weekly 5 (no divergence)
+
+    run_rotate
+    assert_exit 0 "$RC" "mirror-preferred exits 0"
+    assert_eq "acctA" "$(active_label)" "mirror(5h=13) used, endpoint(5h=90) NOT polled => no Trigger A => HOLD on acctA"
+    assert_cred_token "$CRED" "tok-acctA" "mirror-preferred live cred still acctA"
+}
+
+# Reset MISMATCH => mirror is a different account's reading; reject it and poll.
+scenario_mirror_reset_mismatch_falls_back_to_poll() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    make_usage "$STORE/acctA.usage.json" 0 5     # anchor reset 2099-01-08
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 45          # endpoint (correct source) => 5h=90 fires Trigger A
+    make_mock "$MOCK" "tok-acctB" 0 40           # divergence 45-40=5 < 20 => B does NOT fire; only A can swap
+    make_mirror "$MIRROR_FILE" 13 46 "$(( WK_RESET_EPOCH + 100000 ))"  # fresh but reset does NOT match acctA
+
+    run_rotate
+    assert_exit 0 "$RC" "mirror-mismatch exits 0"
+    assert_eq "acctB" "$(active_label)" "reset mismatch => poll endpoint(5h=90) => Trigger A swaps to acctB"
+    assert_cred_token "$CRED" "tok-acctB" "mirror-mismatch live cred is acctB"
+}
+
+# STALE mirror (old mtime) => ignore it and poll.
+scenario_mirror_stale_falls_back_to_poll() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    make_usage "$STORE/acctA.usage.json" 0 5
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 45
+    make_mock "$MOCK" "tok-acctB" 0 40
+    make_mirror "$MIRROR_FILE" 13 46 "$WK_RESET_EPOCH" 7200   # reset matches, but 2h old => stale
+
+    run_rotate
+    assert_exit 0 "$RC" "mirror-stale exits 0"
+    assert_eq "acctB" "$(active_label)" "stale mirror ignored => poll endpoint(5h=90) => Trigger A swaps to acctB"
+    assert_cred_token "$CRED" "tok-acctB" "mirror-stale live cred is acctB"
+}
+
+# No anchor (<active>.usage.json absent) => identity cannot be proven => poll.
+scenario_mirror_no_anchor_falls_back_to_poll() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    # NO acctA.usage.json anchor.
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 45
+    make_mock "$MOCK" "tok-acctB" 0 40
+    make_mirror "$MIRROR_FILE" 13 46 "$WK_RESET_EPOCH"   # fresh + plausible reset, but no anchor to verify against
+
+    run_rotate
+    assert_exit 0 "$RC" "mirror-no-anchor exits 0"
+    assert_eq "acctB" "$(active_label)" "no anchor => cannot verify identity => poll endpoint(5h=90) => Trigger A swaps to acctB"
+    assert_cred_token "$CRED" "tok-acctB" "mirror-no-anchor live cred is acctB"
+}
+
 # Change 2: a NON-active account with an EXPIRED stored token gets refreshed via its
 # stored refresh token before polling. After the tick <label>.json has the NEW
 # accessToken and a future expiresAt, and the polled usage drives the decision.
@@ -1296,6 +1420,11 @@ run_scenario "Target missing/invalid => no swap"               scenario_target_i
 run_scenario "Token-only swap preserves live mcpOAuth"         scenario_swap_token_only_preserves_mcp
 run_scenario "status mode mutates nothing"                     scenario_status_mutates_nothing
 run_scenario "No stale-usage fallback: failed poll => UNKNOWN"  scenario_no_stale_usage_fallback
+run_scenario "Mirror supplies reading when endpoint unpollable" scenario_mirror_supplies_reading_when_endpoint_unpollable
+run_scenario "Mirror preferred over endpoint, skips poll"      scenario_mirror_preferred_skips_poll
+run_scenario "Mirror reset mismatch => falls back to poll"     scenario_mirror_reset_mismatch_falls_back_to_poll
+run_scenario "Mirror stale => falls back to poll"              scenario_mirror_stale_falls_back_to_poll
+run_scenario "Mirror without anchor => falls back to poll"     scenario_mirror_no_anchor_falls_back_to_poll
 run_scenario "Refresh expired non-active token before polling"  scenario_refresh_expired_nonactive
 run_scenario "Refresh mock missing => UNKNOWN, store unchanged"  scenario_refresh_missing_unknown
 run_scenario "Active account is never refreshed out of band"    scenario_active_never_refreshed

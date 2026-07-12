@@ -53,6 +53,65 @@ fetch_usage() {
     fi
 }
 
+# read_active_mirror <active_label> - echo a fetch_usage-shaped usage response for
+# the ACTIVE account sourced from the statusline usage mirror, but ONLY when that
+# mirror is safe to trust; echo nothing otherwise (caller then polls the endpoint).
+#
+# Why: the statusline (a live session) already fetches the active account's usage
+# and mirrors it to $ROTATOR_MIRROR_FILE on every render. Reusing it lets the
+# rotator skip a redundant poll on the token most likely to be rate-limited, and
+# keeps the rotator informed even while oauth/usage is 429ing that token (the exact
+# blind-out that parks rotation). The mirror is trusted only when ALL hold:
+#   1. it exists and its mtime is within $ROTATOR_MIRROR_TTL (fresh);
+#   2. it carries a numeric five_hour_pct;
+#   3. its seven_day_reset matches the active account's KNOWN weekly reset (from
+#      $STORE/<active>.usage.json, written only by real polls). The reset is a
+#      stable per-account identifier, so this proves the mirror describes the
+#      active account -- a lingering old-account session (post-swap, still on its
+#      in-memory token) writes a DIFFERENT reset and is rejected, preventing the
+#      mislabel-driven ping-pong the mirror otherwise risks.
+# Utilization is never sourced from stored usage.json (only the reset anchor is),
+# so the deliberate no-stale-usage rule is preserved: a decision never runs on a
+# stale utilization reading.
+read_active_mirror() {
+    local active="$1"
+    local mirror="${ROTATOR_MIRROR_FILE:-/tmp/claude-usage-starship.json}"
+    local ttl="${ROTATOR_MIRROR_TTL:-900}"
+    [ -f "$mirror" ] || return 0
+
+    local now mmod age
+    now=$(date +%s)
+    mmod=$(stat -c %Y "$mirror" 2>/dev/null || echo 0)
+    age=$(( now - mmod ))
+    [ "$age" -le "$ttl" ] || return 0
+
+    local m5 m7 mreset
+    m5=$(jq -r '.five_hour_pct // empty' "$mirror" 2>/dev/null)
+    m7=$(jq -r '.seven_day_pct // empty' "$mirror" 2>/dev/null)
+    mreset=$(jq -r '.seven_day_reset // empty' "$mirror" 2>/dev/null)
+    [ -n "$m5" ] || return 0
+    [ -n "$mreset" ] && [ "$mreset" != "null" ] || return 0
+
+    # Identity anchor: the active account's last real-poll weekly reset.
+    local ustore="$STORE/$active.usage.json"
+    [ -f "$ustore" ] || return 0
+    local s5reset s7reset s7epoch
+    s7reset=$(jq -r '.seven_day.resets_at // empty' "$ustore" 2>/dev/null)
+    [ -n "$s7reset" ] || return 0
+    s7epoch=$(date -d "$s7reset" +%s 2>/dev/null) || return 0
+    [ -n "$s7epoch" ] || return 0
+    local diff=$(( mreset - s7epoch ))
+    [ "$diff" -lt 0 ] && diff=$(( -diff ))
+    [ "$diff" -le 300 ] || return 0
+
+    # Identity proven. Emit the mirror's utilization in fetch_usage's shape,
+    # reusing the anchor's stored resets_at (informational; keeps the anchor set
+    # only by real polls, never overwritten by mirror data).
+    s5reset=$(jq -r '.five_hour.resets_at // empty' "$ustore" 2>/dev/null)
+    printf '{"five_hour":{"utilization":%s,"resets_at":"%s"},"seven_day":{"utilization":%s,"resets_at":"%s"}}' \
+        "$m5" "$s5reset" "${m7:-0}" "$s7reset"
+}
+
 # write_usage <label> <resp> - atomically write $STORE/<label>.usage.json from a
 # usage response, normalized to the SPEC shape with a captured_at epoch. Temp
 # file in $STORE + chmod 600 + mv -f; removes the temp on failure.
