@@ -5,3 +5,6 @@ config.env
 *.credentials.json
 accounts/
 *.log
+
+# Internal working notes/scratch, never for a public repo
+.projects/

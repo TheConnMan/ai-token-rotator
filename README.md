@@ -1,14 +1,63 @@
 # claude-token-rotator
 
-Automatically rotate the active Claude Code OAuth account across N logged-in Max
-accounts by hot-swapping `~/.claude/.credentials.json` on a systemd user timer,
-so unattended background work keeps running against whichever account has budget.
+**Seamlessly pool multiple Claude subscriptions as one.** If you have two or more
+Claude accounts, each with its own subscription, this rotates the account Claude
+Code is actively using so your work automatically runs against whichever account
+still has budget. When one account hits its 5-hour or weekly limit, the rotator
+hot-swaps to a fresher one within seconds, with no manual `/login` and no
+interruption to running jobs. It is built for unattended, long-running background
+work that would otherwise stall the moment a single account runs out.
 
+It works by rotating the active Claude Code OAuth account across your logged-in
+accounts, hot-swapping `~/.claude/.credentials.json` on a systemd user timer.
 Claude Code re-reads `.credentials.json` on nearly every API call, so atomically
 rewriting the account token in that file redirects even already-running jobs
 within seconds. With one account this is a monitored no-op; it starts rotating
 the moment a second account is bootstrapped. See `SPEC.md` for the full behavior
 and acceptance criteria.
+
+## Requirements
+
+- **Linux with systemd** (the scheduler is a systemd *user* timer).
+- **Claude Code** installed and working.
+- **Two or more Claude accounts**, each with an active subscription, that you can
+  `/login` to in Claude Code. (One account works too; it just runs as a monitored
+  no-op until you add a second.)
+- **`jq`** and **`curl`** on `PATH` (`bash`, `awk`, `date`, `stat`, `mktemp` are
+  standard). On Debian/Ubuntu: `sudo apt install jq curl`.
+
+## Quick start
+
+Pointing an agent at this repo? Hand it this README plus `SPEC.md` (the SPEC is the
+full behavioral contract) and it has everything it needs. To set up by hand:
+
+```
+# 1. Clone and enter the repo
+git clone https://github.com/TheConnMan/claude-token-rotator.git
+cd claude-token-rotator
+
+# 2. Create your config and list the account labels you will use
+cp config.env.example config.env
+$EDITOR config.env          # set ACCOUNTS="acctA acctB" (your labels) + thresholds
+
+# 3. Capture each account (see "Bootstrap flow" below for the MCP details).
+#    In claude, /login to the account, then bootstrap it with a matching label:
+./bootstrap.sh acctA
+./bootstrap.sh acctB        # repeat /login + bootstrap for each account
+
+# 4. Go live: create the master-switch sentinel
+touch ~/.claude/accounts/ENABLED
+
+# 5. Install and start the timer (the scheduled runner)
+./install.sh
+
+# 6. (Headless boxes only) keep the user timer running while logged out:
+loginctl enable-linger "$USER"
+```
+
+The labels you bootstrap in step 3 MUST match the `ACCOUNTS` list in `config.env`.
+Confirm the current decision at any time with `./rotate.sh status`. Installing the
+timer is safe at any point: `rotate.sh` no-ops until the `ENABLED` sentinel exists.
 
 ## How it works
 
