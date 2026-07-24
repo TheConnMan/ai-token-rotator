@@ -1377,6 +1377,124 @@ scenario_pin_unconfigured_label_holds() {
     esac
 }
 
+# Weekly-exhaustion escape valve: while pinned, if the PINNED account's weekly is
+# KNOWN and >= WEEKLY_PIN_RELEASE_PCT (default 98), the tick DEGRADES to normal
+# rotation (Trigger A/B run as if unpinned) without deleting $STORE/PIN. active=acctA
+# is pinned with weekly=98 (exactly the boundary; inclusive release at the default);
+# acctB is far lower weekly (10). Under the release the divergence (98-10=88 >= 20)
+# fires Trigger B and swaps to acctB. The decision is SWAP, never PINNED, and the PIN
+# sentinel survives (override, not delete).
+scenario_pin_weekly_exhausted_releases_to_rotation() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 98   # pinned+active: 5h low (no A), weekly == release boundary
+    make_mock "$MOCK" "tok-acctB" 10 10   # low weekly => divergence target
+    set_pin acctA
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "pin-weekly-exhausted status exits 0"
+    case "$OUT" in
+        *decision=SWAP*) ;;
+        *) fail "pin-weekly-exhausted status did not include decision=SWAP" ;;
+    esac
+    case "$OUT" in
+        *decision=PINNED*) fail "pin-weekly-exhausted status included decision=PINNED" ;;
+    esac
+
+    run_rotate
+    assert_exit 0 "$RC" "pin-weekly-exhausted live exits 0"
+    assert_eq "acctB" "$(active_label)" "pin-weekly-exhausted swapped to acctB (pin released)"
+    assert_cred_token "$CRED" "tok-acctB" "pin-weekly-exhausted live cred is acctB"
+    # Override without delete: the writer owns cleanup, so the sentinel must survive.
+    [ -f "$STORE/PIN" ] || fail "pin-weekly-exhausted deleted PIN file (must override without deleting)"
+}
+
+# Inclusive-threshold boundary: weekly=97 is BELOW the default release (98), so the
+# pin stays in force exactly as today even though acctB (weekly=10) would otherwise
+# be a valid divergence target. decision=PINNED, no swap.
+scenario_pin_weekly_below_release_stays_pinned() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 97   # weekly 97 < release 98 => pin holds
+    make_mock "$MOCK" "tok-acctB" 10 10
+    set_pin acctA
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "pin-below-release status exits 0"
+    case "$OUT" in
+        *decision=PINNED*) ;;
+        *) fail "pin-below-release status did not include decision=PINNED" ;;
+    esac
+    case "$OUT" in
+        *decision=SWAP*) fail "pin-below-release status included decision=SWAP" ;;
+    esac
+
+    run_rotate
+    assert_exit 0 "$RC" "pin-below-release live exits 0"
+    assert_eq "acctA" "$(active_label)" "pin-below-release pointer unchanged (still pinned)"
+    assert_cred_token "$CRED" "tok-acctA" "pin-below-release live cred still acctA"
+}
+
+# Release degrades to rotation even when rotation then finds nothing to do. active=acctA
+# pinned weekly=98 (>= release, released), but acctB is ALSO weekly-exhausted (98), so no
+# trigger has a lower valid target. The tick must NOT report PINNED (the pin released) and
+# must HOLD.
+scenario_pin_weekly_exhausted_no_target_holds_not_pinned() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 98   # released, but no lower target exists
+    make_mock "$MOCK" "tok-acctB" 10 98   # other account also weekly-exhausted
+    set_pin acctA
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "pin-no-target status exits 0"
+    case "$OUT" in
+        *decision=PINNED*) fail "pin-no-target status included decision=PINNED (should have released)" ;;
+    esac
+    case "$OUT" in
+        *decision=HOLD*) ;;
+        *) fail "pin-no-target status did not include decision=HOLD" ;;
+    esac
+
+    run_rotate
+    assert_exit 0 "$RC" "pin-no-target live exits 0"
+    assert_eq "acctA" "$(active_label)" "pin-no-target pointer unchanged (degraded to HOLD)"
+}
+
+# UNKNOWN weekly must never release the pin. active=acctA is pinned but its poll fails
+# (no usage mock for tok-acctA) with no anchor and no mirror to supply a reading, so its
+# weekly is UNKNOWN. The pin stays in force: decision=PINNED, never released on unknown.
+scenario_pin_weekly_unknown_stays_pinned() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    # NO mock for tok-acctA => active poll fails; no anchor + no mirror => weekly UNKNOWN.
+    make_mock "$MOCK" "tok-acctB" 10 10
+    set_pin acctA
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "pin-weekly-unknown status exits 0"
+    case "$OUT" in
+        *decision=PINNED*) ;;
+        *) fail "pin-weekly-unknown status did not include decision=PINNED (unknown must not release)" ;;
+    esac
+}
+
 # ============================================================================
 # Runner
 # ============================================================================
@@ -1445,6 +1563,10 @@ run_scenario "PIN decision literal is not HOLD"                 scenario_pin_dec
 run_scenario "PIN absent keeps swap behavior"                   scenario_pin_absent_unchanged_swap
 run_scenario "PIN invalid target holds and reports PINNED"      scenario_pin_invalid_target_holds_but_pinned
 run_scenario "PIN unconfigured label holds (not in ACCOUNTS)"   scenario_pin_unconfigured_label_holds
+run_scenario "PIN weekly-exhausted releases to rotation"        scenario_pin_weekly_exhausted_releases_to_rotation
+run_scenario "PIN weekly below release stays pinned"            scenario_pin_weekly_below_release_stays_pinned
+run_scenario "PIN weekly-exhausted no target => HOLD not PINNED" scenario_pin_weekly_exhausted_no_target_holds_not_pinned
+run_scenario "PIN weekly unknown stays pinned"                  scenario_pin_weekly_unknown_stays_pinned
 
 printf '\n----------------------------------------\n'
 printf 'Summary: %d passed, %d failed\n' "$PASS" "$FAILED"

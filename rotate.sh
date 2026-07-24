@@ -22,6 +22,7 @@ source "$HERE/lib.sh"
 : "${WEEKLY_DIVERGENCE_VHI_FLOOR:=90}"   # when the min weekly is >= this, dead zone shrinks...
 : "${WEEKLY_DIVERGENCE_VHI_PCT:=2.5}"    # ...to this (tightest near the 100 ceiling)
 : "${INTERVAL_MIN:=15}"
+: "${WEEKLY_PIN_RELEASE_PCT:=98}"
 
 # Test hook: warn (stderr only, no store writes) when the usage mock is active so
 # a real run can never silently poll a mock instead of the real endpoint.
@@ -71,7 +72,9 @@ fi
 # active=<label> by swapping in its stored token and SUSPEND Trigger A/B,
 # emitting decision=PINNED. A stale PIN pins forever by design; the writer owns
 # cleanup. PINNED is distinct from the HOLD decision, which means a trigger did
-# not fire this tick. PINNED means swap decisions are operator driven.
+# not fire this tick. PINNED means swap decisions are operator driven. Exception:
+# a weekly-exhaustion escape valve releases the pin for a tick when the pinned
+# account's weekly is spent (see PIN_ACTIVE below).
 PINNED=0
 PIN_LABEL=""
 if [ -f "$STORE/PIN" ]; then
@@ -198,7 +201,22 @@ targetB=""
 target=""
 reason=""
 effZone=""
-if [ "$PINNED" -eq 0 ]; then
+pin_released=0
+
+# Weekly-exhaustion escape valve: while pinned, if the pinned account's weekly is
+# KNOWN and >= WEEKLY_PIN_RELEASE_PCT (inclusive), degrade this tick to normal
+# rotation by running Trigger A/B as if unpinned. We override the pin via an
+# EFFECTIVE flag (PIN_ACTIVE) and do NOT delete $STORE/PIN: the writer owns cleanup,
+# and if weekly later resets the pin naturally resumes. Unknown or below-threshold
+# weekly leaves the pin fully in force.
+PIN_ACTIVE=$PINNED
+if [ "$PINNED" -eq 1 ] && [ -n "$PIN_LABEL" ] && [ -n "${WEEK[$PIN_LABEL]:-}" ] \
+    && num_ge "${WEEK[$PIN_LABEL]}" "$WEEKLY_PIN_RELEASE_PCT"; then
+    PIN_ACTIVE=0
+    pin_released=1
+fi
+
+if [ "$PIN_ACTIVE" -eq 0 ]; then
     # Trigger A: ACTIVE 5h is KNOWN and >= FIVE_HOUR_PCT. Target = the
     # non-ACTIVE account with a KNOWN 5h and a valid stored cred that has the
     # LOWEST 5h; ties broken by lowest weekly.
@@ -294,7 +312,7 @@ if [ -n "$target" ] && [ "$target" != "$ACTIVE" ] && valid_cred "$STORE/$target.
     SHOULD_SWAP=1
 fi
 if [ "$SHOULD_SWAP" -eq 0 ]; then
-    if [ "$PINNED" -eq 1 ]; then
+    if [ "$PIN_ACTIVE" -eq 1 ]; then
         if [ "$target" = "$ACTIVE" ]; then
             reason="pinned to $PIN_LABEL (already active)"
         else
@@ -311,6 +329,11 @@ if [ "$SHOULD_SWAP" -eq 0 ]; then
     fi
 fi
 
+# Released pin: surface it in the log so the override is visible, and never as PINNED.
+if [ "$pin_released" -eq 1 ]; then
+    reason="pin-released ($PIN_LABEL weekly=${WEEK[$PIN_LABEL]} >= $WEEKLY_PIN_RELEASE_PCT); $reason"
+fi
+
 # One decision line with every account's (5h, weekly).
 usages=""
 for label in "${ACCT_ARR[@]}"; do
@@ -318,7 +341,7 @@ for label in "${ACCT_ARR[@]}"; do
 done
 decision=HOLD
 [ "$SHOULD_SWAP" -eq 1 ] && decision=SWAP
-[ "$PINNED" -eq 1 ] && decision=PINNED
+[ "$PIN_ACTIVE" -eq 1 ] && decision=PINNED
 line="active=$ACTIVE trigA=$trigA trigB=$trigB target=${target:-none} decision=$decision reason=$reason usages:$usages"
 
 if [ "$DRY" -eq 1 ]; then
