@@ -59,6 +59,13 @@ suite never touches the real `~/.claude`:
 - `FIVE_HOUR_PCT=80`            swap when the active account's 5h utilization >= this
 - `WEEKLY_DIVERGENCE_PCT=10`    base dead zone; swap when (max weekly - min weekly across accounts) >= this. Tightens adaptively as the floor (min weekly) climbs: to `WEEKLY_DIVERGENCE_HI_PCT=5` at floor >= `WEEKLY_DIVERGENCE_HI_FLOOR=80`, and to `WEEKLY_DIVERGENCE_VHI_PCT=2.5` at floor >= `WEEKLY_DIVERGENCE_VHI_FLOOR=90` (all configurable)
 - `INTERVAL_MIN=15`            systemd timer cadence
+- `WEEKLY_CEIL_DEFAULT=98`     weekly ceiling for any account with no explicit entry
+- `WEEKLY_CEIL_<label>`        per-account override, 0-100. An account at or above its own
+  ceiling is CAPPED: Trigger C moves the pointer off it, no trigger may target it, and a PIN
+  held on it releases. The gap below 100 reserves budget for surfaces the rotator does not
+  control (the Claude mobile and desktop apps spend the same `seven_day` allowance, whether
+  or not the CLI points at that account). Never set 100: consumers treat the ceiling as an
+  admission check and nothing meters mid-job, so work admitted at 99 overruns and hard-fails
 - `ACCOUNTS="acctA acctB"`     space-separated labels; N accounts
 
 ## Usage endpoint (reuse this exact shape; see reference/prototype and the drain controller usage.sh)
@@ -122,8 +129,20 @@ Default is the tick. `status` is a dry read-out: compute and print, never write 
      `(max - min) >= effective dead zone`. The dead zone is `WEEKLY_DIVERGENCE_PCT`
      by default, tightening to 5 when the floor (min weekly) is >= 80 and to 2.5 when
      it is >= 90 (configurable). Target = the account with MIN weekly.
-   - If both fire, Trigger A target wins (relieving 5h pressure is urgent); use weekly
-     as a tie-break among equal-headroom candidates.
+   - Trigger C (weekly ceiling): ACTIVE weekly is known and `>= weekly_ceil(ACTIVE)`.
+     Target = the account with the most headroom under ITS OWN ceiling
+     (`ceil - weekly`), which is the correct comparison when ceilings differ. Requires
+     a known weekly on the candidate; if none has one, C does not fire and B still runs.
+   - No trigger may target a CAPPED account (known weekly `>= ` its own ceiling).
+     Unknown weekly is NOT capped, matching the rule that an unread number never fires
+     a trigger and never disqualifies an account.
+   - Precedence: A, then C, then B. A and C both say the active account is unusable, so
+     they outrank B, which only prefers between two usable accounts. Use weekly as a
+     tie-break among equal-headroom candidates.
+   - Trigger C is NOT redundant with B. Divergence approximates a ceiling only by
+     coincidence: when accounts sit near their respective ceilings the spread collapses
+     below the dead zone, B goes quiet, and the pointer stays parked on the capped
+     account spending its reserve.
    - SHOULD_SWAP only if a valid target exists, `target != ACTIVE`, and
      `valid_cred(<target>.json)`.
 7. always emit one decision line: ACTIVE, every account's (5h, weekly), trigger

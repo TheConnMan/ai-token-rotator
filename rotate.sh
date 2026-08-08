@@ -22,7 +22,13 @@ source "$HERE/lib.sh"
 : "${WEEKLY_DIVERGENCE_VHI_FLOOR:=90}"   # when the min weekly is >= this, dead zone shrinks...
 : "${WEEKLY_DIVERGENCE_VHI_PCT:=2.5}"    # ...to this (tightest near the 100 ceiling)
 : "${INTERVAL_MIN:=15}"
-: "${WEEKLY_PIN_RELEASE_PCT:=98}"
+# Per-account weekly ceiling. An account at or above its own ceiling is CAPPED: it is not a
+# swap destination, the pointer moves off it (Trigger C), and a pin on it releases. The gap
+# below 100 is the reserve for surfaces this rotator does not control, which spend the same
+# seven_day allowance. Override per account with WEEKLY_CEIL_<label> in config.env.
+# The default is 98, the value the previous global pin-release threshold used, so an account
+# with no explicit ceiling behaves exactly as it did before ceilings existed.
+: "${WEEKLY_CEIL_DEFAULT:=98}"
 
 # Test hook: warn (stderr only, no store writes) when the usage mock is active so
 # a real run can never silently poll a mock instead of the real endpoint.
@@ -198,20 +204,44 @@ minEligLabel=""
 minEligWeek=""
 trigB=0
 targetB=""
+trigC=0
+targetC=""
+bestRoom=""
 target=""
 reason=""
 effZone=""
 pin_released=0
 
-# Weekly-exhaustion escape valve: while pinned, if the pinned account's weekly is
-# KNOWN and >= WEEKLY_PIN_RELEASE_PCT (inclusive), degrade this tick to normal
-# rotation by running Trigger A/B as if unpinned. We override the pin via an
-# EFFECTIVE flag (PIN_ACTIVE) and do NOT delete $STORE/PIN: the writer owns cleanup,
-# and if weekly later resets the pin naturally resumes. Unknown or below-threshold
-# weekly leaves the pin fully in force.
+# Every account's own ceiling, resolved once. Config only, so this needs no usage reading.
+declare -A CEIL
+for label in "${ACCT_ARR[@]}"; do
+    CEIL[$label]=$(weekly_ceil "$label")
+done
+
+# capped <label> - true when this account's weekly is KNOWN and at or above its own ceiling.
+# UNKNOWN weekly is deliberately NOT capped, matching the module-wide convention that an
+# unread number never fires a trigger and never disqualifies an account. Failing the other
+# way would let one failed poll strand the pointer with nowhere to move.
+capped() {
+    local label="${1:-}"
+    [ -n "${WEEK[$label]:-}" ] || return 1
+    num_ge "${WEEK[$label]}" "${CEIL[$label]}"
+}
+
+# Weekly-exhaustion escape valve: while pinned, if the pinned account's weekly is KNOWN and
+# at or above ITS OWN ceiling, degrade this tick to normal rotation by running the triggers
+# as if unpinned. We override the pin via an EFFECTIVE flag (PIN_ACTIVE) and do NOT delete
+# $STORE/PIN: the writer owns cleanup, and if weekly later resets the pin naturally resumes.
+# Unknown or below-ceiling weekly leaves the pin fully in force.
+#
+# This reads the per-account ceiling rather than one global number for a specific reason: a
+# pin SUSPENDS Triggers A, B and C, so while it is held nothing can move the pointer off the
+# pinned account. If the release threshold sat above that account's ceiling, every
+# interactive session and every routed background job would keep spending it through its
+# reserve for as long as the pin lasted, and the reserve would exist only on paper.
 PIN_ACTIVE=$PINNED
 if [ "$PINNED" -eq 1 ] && [ -n "$PIN_LABEL" ] && [ -n "${WEEK[$PIN_LABEL]:-}" ] \
-    && num_ge "${WEEK[$PIN_LABEL]}" "$WEEKLY_PIN_RELEASE_PCT"; then
+    && [ -n "${CEIL[$PIN_LABEL]:-}" ] && num_ge "${WEEK[$PIN_LABEL]}" "${CEIL[$PIN_LABEL]}"; then
     PIN_ACTIVE=0
     pin_released=1
 fi
@@ -228,6 +258,10 @@ if [ "$PIN_ACTIVE" -eq 0 ]; then
             [ "$label" = "$ACTIVE" ] && continue
             [ -n "${FIVE[$label]:-}" ] || continue
             valid_cred "$STORE/$label.json" || continue
+            # A capped account is never a destination, whichever trigger is choosing.
+            # Relieving 5h pressure by moving onto an account whose weekly reserve is
+            # already spent trades one stall for a worse one.
+            capped "$label" && continue
             f=${FIVE[$label]}
             w=${WEEK[$label]:-}
             wc=$w
@@ -274,6 +308,11 @@ if [ "$PIN_ACTIVE" -eq 0 ]; then
         if [ -n "${FIVE[$label]:-}" ] && num_ge "${FIVE[$label]}" "$FIVE_HOUR_PCT"; then
             continue
         fi
+        # Same reason as the Trigger A exclusion: an account past its own ceiling has no
+        # budget left to rebalance INTO. Without this the global min-weekly account wins
+        # the comparison even when its own reserve is spent, because the divergence math
+        # compares raw weekly numbers across accounts with different ceilings.
+        capped "$label" && continue
         if [ -z "$minEligWeek" ]; then
             minEligWeek=$w; minEligLabel=$label
         elif num_lt "$w" "$minEligWeek"; then
@@ -285,10 +324,44 @@ if [ "$PIN_ACTIVE" -eq 0 ]; then
         targetB=$minEligLabel
     fi
 
-    # Decide. Trigger A wins over Trigger B when both fire.
+    # Trigger C (reserve): the ACTIVE account is KNOWN to be at or above its OWN ceiling, so
+    # the pointer must move off it even when neither 5h pressure nor divergence fires. This
+    # is the rule that actually protects a reserve. Divergence only APPROXIMATES it, and only
+    # by coincidence: when two accounts sit near their respective ceilings the spread between
+    # them collapses below the dead zone, Trigger B goes quiet, and without this rule the
+    # pointer would stay parked on the capped account spending the reserve.
+    #
+    # Target = the account with the most headroom UNDER ITS OWN ceiling, which is the right
+    # comparison when ceilings differ: an account at 60 against a ceiling of 95 has less to
+    # give than one at 60 against 99. Requires a KNOWN weekly, because headroom is meaningless
+    # without one; if no candidate has a reading, C does not fire and B still gets its turn.
+    if [ -n "${WEEK[$ACTIVE]:-}" ] && capped "$ACTIVE"; then
+        for label in "${ACCT_ARR[@]}"; do
+            [ "$label" = "$ACTIVE" ] && continue
+            [ -n "${WEEK[$label]:-}" ] || continue
+            valid_cred "$STORE/$label.json" || continue
+            capped "$label" && continue
+            # Do not chase a 5h-pressured account: identical flap risk to Trigger B's.
+            if [ -n "${FIVE[$label]:-}" ] && num_ge "${FIVE[$label]}" "$FIVE_HOUR_PCT"; then
+                continue
+            fi
+            room=$(awk -v c="${CEIL[$label]}" -v w="${WEEK[$label]}" 'BEGIN { print c - w }')
+            if [ -z "$bestRoom" ] || num_lt "$bestRoom" "$room"; then
+                bestRoom=$room; targetC=$label
+            fi
+        done
+        [ -n "$targetC" ] && trigC=1
+    fi
+
+    # Decide. A (a hard 5h stall) outranks C (a weekly reserve), which outranks B (a soft
+    # rebalance). A and C both describe the active account being unusable, so they come
+    # first; B only expresses a preference between two usable accounts.
     if [ "$trigA" -eq 1 ] && [ -n "$targetA" ]; then
         target=$targetA
         reason="5h pressure (active=${FIVE[$ACTIVE]} >= $FIVE_HOUR_PCT) -> $target"
+    elif [ "$trigC" -eq 1 ] && [ -n "$targetC" ]; then
+        target=$targetC
+        reason="weekly ceiling (active=${WEEK[$ACTIVE]} >= ${CEIL[$ACTIVE]}) -> $target"
     elif [ "$trigB" -eq 1 ] && [ -n "$targetB" ]; then
         target=$targetB
         reason="weekly divergence ($maxWeek-$minWeek >= $effZone) -> $target"
@@ -300,6 +373,7 @@ else
     # unconfigured or empty PIN holds on ACTIVE (still decision=PINNED).
     trigA=0
     trigB=0
+    trigC=0
     target=""
     for _pl in "${ACCT_ARR[@]}"; do
         [ "$_pl" = "$PIN_LABEL" ] && { target="$PIN_LABEL"; break; }
@@ -318,12 +392,17 @@ if [ "$SHOULD_SWAP" -eq 0 ]; then
         else
             reason="pinned to ${PIN_LABEL:-<empty>} but target invalid; holding on $ACTIVE"
         fi
-    elif [ "$trigA" -eq 1 ] || [ "$trigB" -eq 1 ]; then
+    elif [ "$trigA" -eq 1 ] || [ "$trigB" -eq 1 ] || [ "$trigC" -eq 1 ]; then
         if [ "$trigA" -eq 0 ] && [ "$trigB" -eq 1 ] && [ "$minEligLabel" = "$ACTIVE" ]; then
             reason="weekly divergence but $ACTIVE is already the lowest-weekly account; holding"
         else
             reason="trigger fired but no valid target; holding on $ACTIVE"
         fi
+    elif [ -n "${WEEK[$ACTIVE]:-}" ] && capped "$ACTIVE"; then
+        # The active account is over its ceiling and nothing else has room under its own.
+        # Naming it beats "no trigger": every account is spent and the reserve is now being
+        # eaten, which is the moment to add capacity, not a quiet steady state.
+        reason="$ACTIVE at/over its ceiling (${WEEK[$ACTIVE]} >= ${CEIL[$ACTIVE]}) but no uncapped target; holding"
     else
         reason="no trigger"
     fi
@@ -331,18 +410,21 @@ fi
 
 # Released pin: surface it in the log so the override is visible, and never as PINNED.
 if [ "$pin_released" -eq 1 ]; then
-    reason="pin-released ($PIN_LABEL weekly=${WEEK[$PIN_LABEL]} >= $WEEKLY_PIN_RELEASE_PCT); $reason"
+    reason="pin-released ($PIN_LABEL weekly=${WEEK[$PIN_LABEL]} >= ceiling ${CEIL[$PIN_LABEL]}); $reason"
 fi
 
-# One decision line with every account's (5h, weekly).
+# One decision line with every account's (5h, weekly, ceiling). The ceiling is printed
+# alongside the reading because a weekly of 95 means different things on different accounts
+# now, and a log line you have to cross-reference against config.env to interpret is not a
+# log line.
 usages=""
 for label in "${ACCT_ARR[@]}"; do
-    usages="$usages $label(5h=${FIVE[$label]:-?},wk=${WEEK[$label]:-?})"
+    usages="$usages $label(5h=${FIVE[$label]:-?},wk=${WEEK[$label]:-?}/${CEIL[$label]})"
 done
 decision=HOLD
 [ "$SHOULD_SWAP" -eq 1 ] && decision=SWAP
 [ "$PIN_ACTIVE" -eq 1 ] && decision=PINNED
-line="active=$ACTIVE trigA=$trigA trigB=$trigB target=${target:-none} decision=$decision reason=$reason usages:$usages"
+line="active=$ACTIVE trigA=$trigA trigB=$trigB trigC=$trigC target=${target:-none} decision=$decision reason=$reason usages:$usages"
 
 if [ "$DRY" -eq 1 ]; then
     echo "status: $line"

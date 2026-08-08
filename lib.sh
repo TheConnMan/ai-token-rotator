@@ -417,3 +417,24 @@ weekly_dead_zone() {
         -v vf="${WEEKLY_DIVERGENCE_VHI_FLOOR}" -v vp="${WEEKLY_DIVERGENCE_VHI_PCT}" \
         'BEGIN { z = base; if (m >= hf && hp < z) z = hp; if (m >= vf && vp < z) z = vp; print z }'
 }
+
+# weekly_ceil <label> - echo one account's weekly ceiling, 0-100.
+#
+# An account is "capped" at or above its ceiling: the rotator stops routing work to it and
+# reserves the remainder for surfaces it does not control. That reserve is not theoretical.
+# The Claude mobile and desktop apps spend the SAME seven_day allowance this rotator polls,
+# and they do it whether or not the CLI is pointed at that account, so without a per-account
+# ceiling an account you also use from your phone gets drained to the limit by background work.
+#
+# Resolution order: WEEKLY_CEIL_<label> from config.env, then WEEKLY_CEIL_DEFAULT. The label
+# is sanitized to a valid shell identifier, so a label with a dot or dash still resolves.
+weekly_ceil() {
+    local label="${1:-}" var val
+    var="WEEKLY_CEIL_$(printf '%s' "$label" | tr -c 'A-Za-z0-9_' '_')"
+    val="${!var:-}"
+    if [ -n "$val" ]; then
+        printf '%s\n' "$val"
+    else
+        printf '%s\n' "${WEEKLY_CEIL_DEFAULT}"
+    fi
+}
