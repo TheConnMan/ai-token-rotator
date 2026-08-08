@@ -939,8 +939,9 @@ scenario_refresh_expired_nonactive() {
     if ! awk -v e="$new_exp" -v n="$now_ms" 'BEGIN { exit (e > n) ? 0 : 1 }'; then
         fail "refresh-expired expiresAt not in the future (expiresAt=$new_exp now_ms=$now_ms)"
     fi
-    # The refreshed poll (acctA 5h=5, wk=50) must appear in the decision line.
-    if ! grep -q 'acctA(5h=5,wk=50)' "$STORE/rotate.log"; then
+    # The refreshed poll (acctA 5h=5, wk=50) must appear in the decision line. The weekly is
+    # printed as used/ceiling; with no per-account entry acctA gets WEEKLY_CEIL_DEFAULT (98).
+    if ! grep -q 'acctA(5h=5,wk=50/98)' "$STORE/rotate.log"; then
         fail "refresh-expired decision did not reflect the polled acctA usage"
     fi
 }
@@ -965,7 +966,8 @@ scenario_refresh_missing_unknown() {
     assert_exit 0 "$RC" "refresh-missing exits 0"
     assert_eq "$a_before" "$(file_sha "$STORE/acctA.json")" "refresh-missing left acctA.json byte-unchanged"
     assert_eq "acctB" "$(active_label)" "refresh-missing held on acctB (acctA UNKNOWN, no swap)"
-    if ! grep -q 'acctA(5h=?,wk=?)' "$STORE/rotate.log"; then
+    # Unknown prints as ? for the reading; the ceiling is config, so it still resolves.
+    if ! grep -q 'acctA(5h=?,wk=?/98)' "$STORE/rotate.log"; then
         fail "refresh-missing did not report acctA as UNKNOWN (?) in the decision line"
     fi
 }
@@ -1567,6 +1569,190 @@ run_scenario "PIN weekly-exhausted releases to rotation"        scenario_pin_wee
 run_scenario "PIN weekly below release stays pinned"            scenario_pin_weekly_below_release_stays_pinned
 run_scenario "PIN weekly-exhausted no target => HOLD not PINNED" scenario_pin_weekly_exhausted_no_target_holds_not_pinned
 run_scenario "PIN weekly unknown stays pinned"                  scenario_pin_weekly_unknown_stays_pinned
+
+# ---------------------------------------------------------------- per-account ceilings
+#
+# Each account carries its OWN weekly ceiling: work stops being routed to it at or above
+# that number, reserving the remainder for surfaces this rotator does not control. The
+# mobile and desktop apps spend the SAME seven_day allowance the rotator polls (confirmed
+# from rotate.log: one account's weekly rose 57 points across 50 ticks while a different
+# account was active), so the reserve is what those surfaces live on.
+#
+# WEEKLY_CEIL_DEFAULT is 98, which is the value the old global WEEKLY_PIN_RELEASE_PCT had,
+# so an account with no explicit ceiling behaves exactly as before.
+
+# Append per-account ceiling settings to the sandbox config.
+set_ceilings() { printf '%s\n' "$@" >> "$CONFIG"; }
+
+# Trigger C (reserve): the ACTIVE account is at its own ceiling, so the pointer moves to an
+# account with headroom under ITS own ceiling. Isolated from Trigger B on purpose: the two
+# accounts are 1 point apart and the adaptive dead zone at a 94 floor is 2.5, so divergence
+# cannot fire and only the reserve rule can explain the swap.
+scenario_ceiling_reserve_swaps_off_capped_account() {
+    make_config "$CONFIG" "acctA acctB"
+    set_ceilings "WEEKLY_CEIL_acctA=95" "WEEKLY_CEIL_acctB=99"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 95   # AT its own ceiling; 5h low so Trigger A cannot fire
+    make_mock "$MOCK" "tok-acctB" 10 94   # under its own ceiling; spread 1 < dead zone 2.5
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "ceiling-reserve status exits 0"
+    case "$OUT" in
+        *trigC=1*) ;;
+        *) fail "ceiling-reserve status did not report trigC=1: $OUT" ;;
+    esac
+    case "$OUT" in
+        *decision=SWAP*) ;;
+        *) fail "ceiling-reserve status did not decide SWAP: $OUT" ;;
+    esac
+
+    run_rotate
+    assert_exit 0 "$RC" "ceiling-reserve live exits 0"
+    assert_eq "acctB" "$(active_label)" "ceiling-reserve swapped off the capped account"
+    assert_cred_token "$CRED" "tok-acctB" "ceiling-reserve live cred is acctB"
+}
+
+# The mirror of the above: one point BELOW its ceiling the account keeps the pointer. This is
+# what proves the rule is the ceiling and not merely "high weekly swaps".
+scenario_ceiling_below_ceiling_holds() {
+    make_config "$CONFIG" "acctA acctB"
+    set_ceilings "WEEKLY_CEIL_acctA=95" "WEEKLY_CEIL_acctB=99"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 94   # one point under its ceiling
+    make_mock "$MOCK" "tok-acctB" 10 93   # spread 1 < dead zone 2.5
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "ceiling-below status exits 0"
+    case "$OUT" in
+        *trigC=1*) fail "ceiling-below fired the reserve trigger under the ceiling: $OUT" ;;
+    esac
+    case "$OUT" in
+        *decision=HOLD*) ;;
+        *) fail "ceiling-below did not hold: $OUT" ;;
+    esac
+
+    run_rotate
+    assert_eq "acctA" "$(active_label)" "ceiling-below kept the pointer on acctA"
+}
+
+# An account at or over its OWN ceiling is not a valid destination for any trigger. Here
+# divergence fires hard (95 vs 10) and the global min-weekly account is acctB, but acctB sits
+# over its own ceiling of 5, so the pointer must land on acctC instead. Without the exclusion
+# the rebalance would park work on an account whose reserve is already spent.
+scenario_ceiling_capped_account_is_never_a_target() {
+    make_config "$CONFIG" "acctA acctB acctC"
+    set_ceilings "WEEKLY_CEIL_DEFAULT=99" "WEEKLY_CEIL_acctB=5"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    seed_account acctC "tok-acctC"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 95   # under its 99 ceiling, so the reserve rule stays quiet
+    make_mock "$MOCK" "tok-acctB" 10 10   # global min weekly, but OVER its own ceiling of 5
+    make_mock "$MOCK" "tok-acctC" 10 40   # the only legitimate destination
+
+    run_rotate
+    assert_exit 0 "$RC" "ceiling-target-exclusion live exits 0"
+    assert_eq "acctC" "$(active_label)" "ceiling-target-exclusion skipped the over-ceiling min-weekly account"
+    assert_cred_token "$CRED" "tok-acctC" "ceiling-target-exclusion live cred is acctC"
+}
+
+# The pin escape valve now releases at the PINNED ACCOUNT'S OWN ceiling. This is the
+# discriminating case for that change: at weekly 95 the old global release threshold of 98
+# kept the pin in force, and because a pin suspends Triggers A and B, every interactive and
+# routed job kept spending the account straight through its reserve.
+scenario_ceiling_pin_releases_at_account_ceiling() {
+    make_config "$CONFIG" "acctA acctB"
+    set_ceilings "WEEKLY_CEIL_acctA=95"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 95   # its own ceiling, well below the old global 98
+    make_mock "$MOCK" "tok-acctB" 10 10
+    set_pin acctA
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "ceiling-pin-release status exits 0"
+    case "$OUT" in
+        *decision=PINNED*) fail "ceiling-pin-release stayed PINNED at the account ceiling: $OUT" ;;
+    esac
+    case "$OUT" in
+        *decision=SWAP*) ;;
+        *) fail "ceiling-pin-release did not decide SWAP: $OUT" ;;
+    esac
+
+    run_rotate
+    assert_eq "acctB" "$(active_label)" "ceiling-pin-release swapped away from the capped pinned account"
+    # Override without delete: the writer still owns cleanup.
+    [ -f "$STORE/PIN" ] || fail "ceiling-pin-release deleted the PIN file"
+}
+
+# Below its own ceiling a pinned account stays pinned, so the release is a ceiling rule and
+# not a blanket weakening of the pin.
+scenario_ceiling_pin_holds_below_account_ceiling() {
+    make_config "$CONFIG" "acctA acctB"
+    set_ceilings "WEEKLY_CEIL_acctA=95"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 94   # one point under its ceiling
+    make_mock "$MOCK" "tok-acctB" 10 10
+    set_pin acctA
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "ceiling-pin-hold status exits 0"
+    case "$OUT" in
+        *decision=PINNED*) ;;
+        *) fail "ceiling-pin-hold did not stay PINNED under the ceiling: $OUT" ;;
+    esac
+
+    run_rotate
+    assert_eq "acctA" "$(active_label)" "ceiling-pin-hold kept the pin on acctA"
+}
+
+# An account with no WEEKLY_CEIL_<label> entry falls back to WEEKLY_CEIL_DEFAULT. Set here to
+# 90 so the fallback is observable rather than coinciding with the shipped default.
+scenario_ceiling_default_applies_to_unnamed_account() {
+    make_config "$CONFIG" "acctA acctB"
+    set_ceilings "WEEKLY_CEIL_DEFAULT=90"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 90   # at the DEFAULT ceiling, no per-account entry
+    make_mock "$MOCK" "tok-acctB" 10 89   # spread 1 < dead zone 5 at an 89 floor
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "ceiling-default status exits 0"
+    case "$OUT" in
+        *trigC=1*) ;;
+        *) fail "ceiling-default did not apply WEEKLY_CEIL_DEFAULT: $OUT" ;;
+    esac
+
+    run_rotate
+    assert_eq "acctB" "$(active_label)" "ceiling-default swapped off the account at the default ceiling"
+}
+
+run_scenario "Ceiling: reserve swaps off a capped account"      scenario_ceiling_reserve_swaps_off_capped_account
+run_scenario "Ceiling: one point under the ceiling holds"       scenario_ceiling_below_ceiling_holds
+run_scenario "Ceiling: a capped account is never a target"      scenario_ceiling_capped_account_is_never_a_target
+run_scenario "Ceiling: pin releases at the account ceiling"     scenario_ceiling_pin_releases_at_account_ceiling
+run_scenario "Ceiling: pin holds below the account ceiling"     scenario_ceiling_pin_holds_below_account_ceiling
+run_scenario "Ceiling: default applies to an unnamed account"   scenario_ceiling_default_applies_to_unnamed_account
 
 printf '\n----------------------------------------\n'
 printf 'Summary: %d passed, %d failed\n' "$PASS" "$FAILED"

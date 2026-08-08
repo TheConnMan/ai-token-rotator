@@ -155,7 +155,30 @@ writing nothing). No need to stop the timer to pause.
   `WEEKLY_DIVERGENCE_HI_FLOOR` / `WEEKLY_DIVERGENCE_HI_PCT` (default 80 / 5) and
   `WEEKLY_DIVERGENCE_VHI_FLOOR` / `WEEKLY_DIVERGENCE_VHI_PCT` (default 90 / 2.5).
 - `INTERVAL_MIN` (default 15): timer cadence in minutes.
+- `WEEKLY_CEIL_DEFAULT` (default 98) and per-account `WEEKLY_CEIL_<label>`: the weekly
+  ceiling each account is held to. See "Per-account ceilings" below.
 - `ACCOUNTS` (required): space-separated labels, one per bootstrapped account.
+
+## Per-account ceilings
+
+Each account has its own weekly ceiling, and at or above it the account is **capped**:
+the rotator moves the pointer off it, never swaps onto it, and releases an operator PIN
+held on it.
+
+The point is to reserve budget for surfaces this rotator does not control. The Claude
+mobile and desktop apps spend the **same** `seven_day` allowance the rotator polls, and
+they spend it whether or not the CLI is pointed at that account. Without a ceiling,
+unattended background work will drain an account to the limit and your phone stops
+working mid-week. So give an account you also use interactively a ceiling below 100, and
+let an account reserved for background work sit near 100:
+
+```sh
+WEEKLY_CEIL_acctA=95   # keep 5% for the mobile and desktop apps
+WEEKLY_CEIL_acctB=99   # background work only, drain it
+```
+
+Do not set a ceiling of exactly 100. Consumers treat it as an admission check and nothing
+meters mid-job, so work admitted at 99 runs past 100 and fails hard.
 
 ## Decision rule
 
@@ -164,12 +187,23 @@ Utilization is on a 0-100 scale. On each tick:
 - Trigger A (5h pressure): if the ACTIVE account's 5h utilization is at or above
   `FIVE_HOUR_PCT`, swap to the other account with the LOWEST 5h utilization (ties
   broken by lowest weekly).
+- Trigger C (weekly ceiling): if the ACTIVE account is at or above its own ceiling,
+  swap to the account with the most headroom under ITS own ceiling. Headroom rather
+  than raw weekly, because an account at 60 against a ceiling of 95 has less left to
+  give than one at 60 against 99.
 - Trigger B (weekly divergence): if the spread between the maximum and minimum
   weekly utilization is at or above the effective dead zone, swap to the account
   with the MINIMUM weekly utilization. The dead zone is `WEEKLY_DIVERGENCE_PCT` by
   default, tightening to 5 when the floor (min weekly) is at or above 80 and to 2.5
   when it is at or above 90.
-- If both trigger, Trigger A wins (relieving 5h pressure is urgent).
+- Precedence is A, then C, then B. A and C both mean the active account is unusable,
+  so they outrank B, which only expresses a preference between two usable accounts.
+- A capped account is never a target, whichever trigger is choosing.
+
+Trigger C is not redundant with B. Divergence only approximates a ceiling by
+coincidence: when two accounts both sit near their respective ceilings the spread
+between them collapses below the dead zone, B goes quiet, and the pointer would stay
+parked on the capped account spending its reserve.
 
 A swap only happens if a valid target exists, it is not already the active
 account, and its stored credential file is valid. An account whose live usage
