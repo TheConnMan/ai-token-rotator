@@ -14,6 +14,7 @@ source "$HERE/lib.sh"
 # shellcheck source=/dev/null
 [ -f "${ROTATOR_CONFIG:-$HERE/config.env}" ] && source "${ROTATOR_CONFIG:-$HERE/config.env}"
 : "${INTERVAL_MIN:=15}"
+: "${CODEX_ROTATOR_STORE:=$HOME/.codex/accounts}"
 
 UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"
@@ -41,9 +42,40 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-systemctl --user daemon-reload
-systemctl --user enable --now cc-token-rotator.timer
+cat > "$UNIT_DIR/cc-codex-token-rotator.service" <<EOF
+[Unit]
+Description=Codex token rotator tick
 
-echo "installed and started cc-token-rotator.timer (interval ${INTERVAL_MIN}min)"
-echo "SAFE: rotate.sh no-ops until the ENABLED sentinel exists in the store."
-echo "Bootstrap your accounts, then 'touch $STORE/ENABLED' to go live."
+[Service]
+Type=oneshot
+ExecStart=$HERE/codex-rotate.sh
+EOF
+
+cat > "$UNIT_DIR/cc-codex-token-rotator.timer" <<EOF
+[Unit]
+Description=Run the Codex token rotator on a timer
+
+[Timer]
+OnBootSec=5min
+OnActiveSec=1min
+OnUnitActiveSec=${INTERVAL_MIN}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+if ! systemctl --user daemon-reload; then
+  echo "Could not reload systemd user units." >&2
+  exit 1
+fi
+
+if ! systemctl --user enable --now cc-token-rotator.timer cc-codex-token-rotator.timer; then
+  echo "Could not enable token rotator timers." >&2
+  exit 1
+fi
+
+echo "installed and started both token rotator timers (interval ${INTERVAL_MIN}min)"
+echo "SAFE: each rotator does nothing until its own ENABLED sentinel exists."
+echo "Enable Claude rotation with: touch $STORE/ENABLED"
+echo "Enable Codex rotation with: touch $CODEX_ROTATOR_STORE/ENABLED"

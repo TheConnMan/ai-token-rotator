@@ -20,10 +20,11 @@ and acceptance criteria.
 
 - **Linux with systemd** (the scheduler is a systemd *user* timer).
 - **Claude Code** installed and working.
+- **Codex** installed and working when rotating Codex accounts.
 - **Two or more Claude accounts**, each with an active subscription, that you can
   `/login` to in Claude Code. (One account works too; it just runs as a monitored
   no-op until you add a second.)
-- **`jq`** and **`curl`** on `PATH` (`bash`, `awk`, `date`, `stat`, `mktemp` are
+- **`jq`**, **`curl`**, and **`flock`** on `PATH` (`bash`, `awk`, `date`, `stat`, `mktemp` are
   standard). On Debian/Ubuntu: `sudo apt install jq curl`.
 
 ## Quick start
@@ -58,6 +59,67 @@ loginctl enable-linger "$USER"
 The labels you bootstrap in step 3 MUST match the `ACCOUNTS` list in `config.env`.
 Confirm the current decision at any time with `./rotate.sh status`. Installing the
 timer is safe at any point: `rotate.sh` no-ops until the `ENABLED` sentinel exists.
+
+## Codex account rotation
+
+Codex rotation runs beside Claude rotation, with its own credentials, store, active
+pointer, sentinel, service, and timer. It rotates `~/.codex/auth.json`; it does not
+share credential material with the Claude store. The Codex store is
+`$CODEX_ROTATOR_STORE`, defaulting to `~/.codex/accounts`.
+
+Labels are shared human names across providers, not shared credentials. For example,
+`Personal` may identify one Claude credential and a different Codex credential. List
+Codex labels separately in `CODEX_ACCOUNTS` in `config.env`, even when the labels
+match `ACCOUNTS`.
+
+The Codex store contains the following raw files:
+
+```
+<label>.tokens      stored Codex token object
+<label>.usage.json  last usage snapshot
+active              label currently stored in the live Codex auth file
+ENABLED             rotation sentinel
+PIN                 optional operator selected label
+rotate.log          timestamped decisions
+rotate.lock         shared operation lock
+```
+
+Like the Claude store, it is outside the repository and has restrictive permissions.
+
+## Codex setup
+
+For each Codex account, run `codex login`, then capture that account with
+`./codex-bootstrap.sh <label>`. Repeat for every `CODEX_ACCOUNTS` label. Bootstrap
+sets the Codex active pointer to the account just captured. After all accounts are
+captured, enable Codex rotation:
+
+```
+touch ~/.codex/accounts/ENABLED
+```
+
+`./codex-rotate.sh status` prints the current decision without changing credentials.
+`./install.sh` installs and starts both the Claude and Codex systemd user timers.
+Each service remains inactive until its own `ENABLED` file exists.
+
+## Codex usage, PIN, and ceilings
+
+Each tick polls every stored Codex account directly through the authenticated WHAM
+usage request, using that account's bearer token and ChatGPT Account Id header. This
+keeps idle accounts observable. If an idle poll fails because its access token has
+expired, the rotator refreshes it once through `auth.openai.com` and retries the poll.
+It does not synthesize a Codex run. When a reported five hour or weekly reset time is
+already past, that window is treated as zero usage because the backend can retain the
+previous window until a real Codex run. An explicit `credits.has_credits=false` still
+means the account is exhausted.
+
+Writing a configured label to the Codex store `PIN` holds that label selected while it
+is usable. A PIN for an account at its weekly ceiling is released for the current
+decision, while the PIN file remains for the next weekly window.
+
+Codex uses the existing shared `WEEKLY_CEIL_<label>` resolver for both its PIN and
+Trigger C ceiling decisions. The same label therefore has the same configured ceiling
+for Claude and Codex. Separate provider ceilings remain a future design decision.
+With one Codex account, `codex-rotate.sh` still polls and logs but never swaps.
 
 ## How it works
 

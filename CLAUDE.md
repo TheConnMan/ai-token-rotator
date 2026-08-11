@@ -26,12 +26,13 @@ receives the merge.
 Both must pass before any merge, and both are fast:
 
 ```bash
-bash tests/run_tests.sh    # 50 passing as of 2026-08-08
+bash tests/run_tests.sh
 shellcheck *.sh
 ```
 
-The suite runs the real `rotate.sh` as a subprocess against `mktemp -d` sandboxes and
-mocks only the usage HTTP call. It never touches the real `~/.claude`, and a hard
+The gate runs the Claude and Codex provider suites. They run the real rotators as
+subprocesses against temporary sandboxes and mock external usage, OAuth refresh,
+and systemctl boundaries only. They never touch real provider homes, and a hard
 `guard_tmp` abort enforces that. Keep it that way: do not add a test that points at a
 real home path, and do not mock a file operation.
 

@@ -1756,4 +1756,12 @@ run_scenario "Ceiling: default applies to an unnamed account"   scenario_ceiling
 
 printf '\n----------------------------------------\n'
 printf 'Summary: %d passed, %d failed\n' "$PASS" "$FAILED"
-[ "$FAILED" -eq 0 ]
+CLAUDE_RC=0
+if [ "$FAILED" -ne 0 ]; then
+    CLAUDE_RC=1
+fi
+
+bash "$SCRIPT_DIR/run_codex_tests.sh"
+CODEX_RC=$?
+
+[ "$CLAUDE_RC" -eq 0 ] && [ "$CODEX_RC" -eq 0 ]

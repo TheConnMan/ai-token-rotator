@@ -267,3 +267,48 @@ NOT mock file ops.
 no config, no per-account polling). Use it as a design crib for the atomic-swap and
 usage-fetch shapes only. The deliverable is the generalized N-account, config-driven
 version in the repo root, built test-first.
+
+## Codex extension
+
+Codex rotation is a separate provider surface. It uses `~/.codex/auth.json`,
+`CODEX_ROTATOR_STORE` (default `~/.codex/accounts`), and `CODEX_ACCOUNTS`. Labels
+are shared human identifiers only: matching Claude and Codex labels identify separate
+provider credentials. See `README.md` for operator setup.
+
+### Codex store and swap
+
+1. `<label>.tokens` stores the complete raw Codex token object from that account's
+  live auth file. The store is outside the repository, mode 0700, and written files
+  are mode 0600.
+2. Bootstrap captures the currently logged in Codex account under its configured
+  label and sets the separate Codex `active` pointer.
+3. A swap atomically replaces only `.tokens` in the live Codex auth object from the
+  target `<label>.tokens`, preserving every other live auth field. It validates the
+  target and merged result before rename, so invalid input never replaces live auth.
+
+### Codex tick
+
+1. The Codex rotator is gated by its own `ENABLED` sentinel. Installation creates an
+  independent Codex service and timer beside the Claude units. Neither provider
+  sentinel enables the other provider.
+2. Every tick polls each Codex account directly through the authenticated WHAM usage
+  endpoint, including idle accounts. It does not create a synthetic Codex run.
+3. If a nonactive poll fails during a live tick, refresh that stored account once and
+  retry its WHAM poll once. Do not refresh the active account out of band. A failed
+  refresh or retry leaves usage unknown and never eligible to fire or target a normal
+  trigger swap.
+4. If a returned five hour or weekly reset is already past, normalize that window to
+  zero usage without a synthetic run. An explicit `credits.has_credits=false` remains
+  exhausted.
+5. The existing `weekly_ceil` resolver and `WEEKLY_CEIL_<label>` configuration govern
+  Codex Trigger C and PIN ceiling behavior too. Matching labels therefore use the
+  same weekly ceiling across providers.
+6. A configured `PIN` with valid stored tokens forces that label active, suspends
+  normal triggers, and reports `PINNED`. PIN force selection may choose the configured
+  label even when its usage is unknown. An empty or unconfigured PIN holds the active
+  label. A PIN is released for the current decision only when its known weekly usage
+  reaches that label's weekly ceiling, while the PIN file remains for the next weekly
+  window.
+7. With one configured Codex account, the tick still polls and logs but never swaps.
+8. Codex status is read only. It never refreshes, writes usage or logs,
+  swaps auth, updates the pointer, or otherwise mutates provider state.
