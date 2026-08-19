@@ -106,6 +106,40 @@ make_usage_mock() {
         }' > "$MOCK/$access.$account.json"
 }
 
+# The real ChatGPT Plus/Pro payload: ONE weekly window, no 5h window at all, arriving in
+# the primary slot. `has_credits:false` is the norm on these plans (no pay-as-you-go
+# top-up) and must NOT be read as exhausted while a real window is present.
+make_usage_mock_weekly_only() {
+    local access="$1" account="$2" weekly="$3"
+    local weekly_reset="${4:-4102444800}" credits="${5:-false}"
+    jq -n \
+        --argjson weekly "$weekly" \
+        --argjson weekly_reset "$weekly_reset" \
+        --argjson credits "$credits" \
+        '{
+            rate_limit: {
+                primary_window: {
+                    used_percent: $weekly,
+                    reset_at: $weekly_reset,
+                    limit_window_seconds: 604800
+                },
+                secondary_window: null
+            },
+            credits: {has_credits: $credits}
+        }' > "$MOCK/$access.$account.json"
+}
+
+# The windowless `premium` shape a fully spent account emits: no window anywhere, so the
+# credits object is the only signal left and IS authoritative here.
+make_usage_mock_windowless() {
+    local access="$1" account="$2" credits="${3:-false}"
+    jq -n --argjson credits "$credits" \
+        '{
+            rate_limit: {primary_window: null, secondary_window: null},
+            credits: {has_credits: $credits, balance: "0"}
+        }' > "$MOCK/$access.$account.json"
+}
+
 make_refresh_mock() {
     local refresh="$1" access="$2" rotated_refresh="$3" id_token="${4:-}"
     jq -n \
@@ -728,7 +762,8 @@ scenario_expired_weekly_reset_becomes_zero() {
     assert_contains "$OUT" "decision=SWAP" "expired weekly reset decision"
 }
 
-scenario_explicit_no_credits_stays_exhausted() {
+scenario_windowless_no_credits_stays_exhausted() {
+    # Credits are authoritative ONLY in the windowless shape, where nothing else can be read.
     make_config "acctA acctB acctC"
     seed_account acctA "accessA" "accountA"
     seed_account acctB "accessB" "accountB"
@@ -737,16 +772,61 @@ scenario_explicit_no_credits_stays_exhausted() {
     enable_codex
     make_auth "$AUTH" "accessA" "accountA" "A"
     make_usage_mock "accessA" "accountA" 90 20
-    make_usage_mock "accessB" "accountB" 99 99 1 1 false
+    make_usage_mock_windowless "accessB" "accountB" false
     make_usage_mock "accessC" "accountC" 20 20
 
     run_rotate
 
-    assert_exit 0 "$RC" "explicit no credits exit"
-    assert_active acctC "explicit no credits excluded exhausted account"
+    assert_exit 0 "$RC" "windowless no credits exit"
+    assert_active acctC "windowless no credits excluded exhausted account"
+    assert_contains "$OUT" "acctB(5h=?,wk=100/98)" "windowless no credits read as spent"
     assert_eq "accessC" "$(jq -r '.tokens.access_token // empty' "$AUTH" 2>/dev/null)" \
-        "explicit no credits selected usable target"
-    assert_contains "$OUT" "decision=SWAP" "explicit no credits decision"
+        "windowless no credits selected usable target"
+    assert_contains "$OUT" "decision=SWAP" "windowless no credits decision"
+}
+
+scenario_real_window_beats_false_credits() {
+    # The live shape of a healthy ChatGPT plan: a real weekly window at 1% alongside
+    # has_credits:false. Reading credits first reported this fresh account as 100% spent,
+    # so the rotator refused to ever swap onto it. The window must win.
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock_weekly_only "accessA" "accountA" 100 4102444800 false
+    make_usage_mock_weekly_only "accessB" "accountB" 1 4102444800 false
+
+    run_rotate
+
+    assert_exit 0 "$RC" "real window beats credits exit"
+    assert_contains "$OUT" "acctB(5h=?,wk=1/98)" "real window won over false credits"
+    assert_active acctB "real window beats credits selected the healthy account"
+    assert_eq "accessB" "$(jq -r '.tokens.access_token // empty' "$AUTH" 2>/dev/null)" \
+        "real window beats credits swapped tokens in"
+    assert_contains "$OUT" "decision=SWAP" "real window beats credits decision"
+}
+
+scenario_absent_five_hour_window_is_unknown() {
+    # These plans ship no 5h window. A missing window must read unknown, never 0: a zero
+    # would be maximum headroom and win every comparison, and it would let Trigger A fire
+    # against a budget that does not exist.
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock_weekly_only "accessA" "accountA" 40 4102444800 false
+    make_usage_mock_weekly_only "accessB" "accountB" 42 4102444800 false
+
+    run_rotate
+
+    assert_exit 0 "$RC" "absent 5h window exit"
+    assert_contains "$OUT" "acctA(5h=?,wk=40/98)" "absent 5h window read as unknown"
+    assert_contains "$OUT" "trigA=0" "absent 5h window cannot fire Trigger A"
+    assert_active acctA "absent 5h window held inside the dead zone"
 }
 
 scenario_unreadable_usage_is_unknown() {
@@ -1141,7 +1221,9 @@ run_scenario "Trigger A wins when all triggers fire"              scenario_trigg
 run_scenario "Trigger C wins over weekly divergence"              scenario_trigger_c_wins_over_weekly_divergence
 run_scenario "PIN releases at its account ceiling"               scenario_pin_releases_at_label_ceiling
 run_scenario "Expired weekly reset becomes zero"                 scenario_expired_weekly_reset_becomes_zero
-run_scenario "Explicit false credits stays exhausted"            scenario_explicit_no_credits_stays_exhausted
+run_scenario "Windowless no credits stays exhausted"             scenario_windowless_no_credits_stays_exhausted
+run_scenario "Real window beats false credits"                   scenario_real_window_beats_false_credits
+run_scenario "Absent 5h window is unknown"                       scenario_absent_five_hour_window_is_unknown
 run_scenario "Unreadable usage is unknown"                       scenario_unreadable_usage_is_unknown
 run_scenario "Missing ENABLED mutates nothing"                   scenario_enabled_absent_mutates_nothing
 run_scenario "Status mutates nothing"                            scenario_status_mutates_nothing

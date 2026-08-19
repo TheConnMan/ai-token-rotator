@@ -116,8 +116,8 @@ for label in "${ACCT_ARR[@]}"; do
             fi
         fi
         if [ -n "$normalized_usage" ]; then
-            FIVE[$label]=$(printf '%s' "$normalized_usage" | jq -r '.five_hour.utilization')
-            WEEK[$label]=$(printf '%s' "$normalized_usage" | jq -r '.seven_day.utilization')
+            FIVE[$label]=$(printf '%s' "$normalized_usage" | jq -r '.five_hour.utilization // empty')
+            WEEK[$label]=$(printf '%s' "$normalized_usage" | jq -r '.seven_day.utilization // empty')
             if [ "$DRY" -eq 0 ]; then
                 codex_write_usage "$label" "$normalized_usage" \
                     || codex_log "failed to write Codex usage for $label"

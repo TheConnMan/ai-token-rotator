@@ -204,11 +204,35 @@ codex_normalize_usage() {
     [ -n "$resp" ] || return 1
     now=$(date +%s)
 
+    # Window-first, credits-last. A real rate-limit window ALWAYS wins over the credits
+    # object: on a ChatGPT Plus/Pro plan `has_credits:false` with `balance:"0"` means no
+    # pay-as-you-go top-up, which says nothing about the plan's included weekly quota.
+    # Reading it as "exhausted" reports a fresh account at 0% as fully spent, and the
+    # rotator then refuses to ever swap onto it. Credits are authoritative only in the
+    # windowless `premium` shape, where there is no window anywhere to read instead.
+    #
+    # A missing window is UNKNOWN (null), never 0. These plans ship no 5h window at all -
+    # the weekly arrives alone, and in either the primary or the secondary slot - so a
+    # zero would read as maximum headroom and win every comparison.
     printf '%s' "$resp" | jq -ce --argjson now "$now" '
         def maybe_number:
             if type == "number" then .
             elif type == "string" then (try tonumber catch null)
             else null
+            end;
+        def read_window($w; $now):
+            if ($w | type) != "object" then {utilization: null, resets_at: null}
+            else
+                ($w.used_percent? | maybe_number) as $used
+                | ($w.reset_at? | maybe_number) as $reset
+                | if $used == null or $reset == null or $used < 0 or $used > 100 then
+                      {utilization: null, resets_at: null}
+                  else
+                      {
+                          utilization: (if $reset <= $now then 0 else $used end),
+                          resets_at: $reset
+                      }
+                  end
             end;
         . as $root
         | ($root.rate_limit.primary_window? // null) as $primary
@@ -221,40 +245,22 @@ codex_normalize_usage() {
             | map(select(type == "object" and (.limit_window_seconds? == 604800)))
             | .[0] // null) as $weekly
         | ($root.credits.has_credits? | tostring) as $has_credits
-        | if $has_credits == "false" then
-              {
-                  five_hour: {
-                      utilization: 100,
-                      resets_at: ($five.reset_at? | maybe_number)
-                  },
-                  seven_day: {
-                      utilization: 100,
-                      resets_at: ($weekly.reset_at? | maybe_number)
+        | if $five == null and $weekly == null then
+              if $has_credits == "false" then
+                  {
+                      five_hour: {utilization: null, resets_at: null},
+                      seven_day: {utilization: 100, resets_at: null}
                   }
-              }
-          elif ($five | type) != "object" or ($weekly | type) != "object" then
-              empty
+              else
+                  empty
+              end
           else
-              ($five.used_percent? | maybe_number) as $five_used
-              | ($weekly.used_percent? | maybe_number) as $weekly_used
-              | ($five.reset_at? | maybe_number) as $five_reset
-              | ($weekly.reset_at? | maybe_number) as $weekly_reset
-              | if $five_used == null or $weekly_used == null
-                    or $five_reset == null or $weekly_reset == null
-                    or $five_used < 0 or $five_used > 100
-                    or $weekly_used < 0 or $weekly_used > 100 then
+              read_window($five; $now) as $five_out
+              | read_window($weekly; $now) as $weekly_out
+              | if $five_out.utilization == null and $weekly_out.utilization == null then
                     empty
                 else
-                    {
-                        five_hour: {
-                            utilization: (if $five_reset <= $now then 0 else $five_used end),
-                            resets_at: $five_reset
-                        },
-                        seven_day: {
-                            utilization: (if $weekly_reset <= $now then 0 else $weekly_used end),
-                            resets_at: $weekly_reset
-                        }
-                    }
+                    {five_hour: $five_out, seven_day: $weekly_out}
                 end
           end
     ' 2>/dev/null
