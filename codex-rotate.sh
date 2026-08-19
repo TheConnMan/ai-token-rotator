@@ -299,6 +299,21 @@ if [ "$SHOULD_SWAP" -eq 0 ]; then
     fi
 fi
 
+# A swap restarts the app-server, which interrupts every running turn, so no
+# swap may fire while Codex work is in flight. An unanswerable probe counts as
+# in flight; the cost of waiting one tick is far below the cost of killing a job.
+if [ "$SHOULD_SWAP" -eq 1 ]; then
+    codex_work_in_flight
+    inflight_rc=$?
+    if [ "$inflight_rc" -eq 0 ]; then
+        SHOULD_SWAP=0
+        reason="Codex work in flight; holding on $ACTIVE rather than restarting the app-server"
+    elif [ "$inflight_rc" -eq 2 ]; then
+        SHOULD_SWAP=0
+        reason="Codex in-flight probe failed, assuming work in flight; holding on $ACTIVE"
+    fi
+fi
+
 if [ "$pin_released" -eq 1 ]; then
     reason="pin released for $PIN_LABEL at ceiling ${CEIL[$PIN_LABEL]}; $reason"
 fi
@@ -324,6 +339,14 @@ if [ "$SHOULD_SWAP" -eq 1 ]; then
     elif codex_swap_in_tokens "$CODEX_ROTATOR_STORE/$target.tokens" "$CODEX_ROTATOR_AUTH" "$active_store"; then
         if codex_write_active "$target"; then
             codex_log "SWAP $ACTIVE to $target: $reason usages:$usages"
+            if [ "$CODEX_APPSERVER_RESTART" = "1" ]; then
+                codex_kill_appserver
+                case $? in
+                    0) codex_log "app-server killed to pick up $target; it respawns on the next Codex Desktop connect" ;;
+                    2) codex_log "no app-server running; nothing to restart for $target" ;;
+                    *) codex_log "app-server restart FAILED; Codex work keeps using $ACTIVE until the process is replaced" ;;
+                esac
+            fi
         else
             codex_log "SWAP FAILED to update active pointer after moving $ACTIVE to $target; restoring live Codex auth"
             if codex_swap_in_tokens "$active_store" "$CODEX_ROTATOR_AUTH" "$CODEX_ROTATOR_STORE/$target.tokens"; then

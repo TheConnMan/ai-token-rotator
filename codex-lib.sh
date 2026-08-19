@@ -20,6 +20,9 @@ CODEX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CODEX_ACCOUNTS:=}"
 : "${CODEX_ROTATOR_AUTH:=$HOME/.codex/auth.json}"
 : "${CODEX_ROTATOR_STORE:=$HOME/.codex/accounts}"
+: "${CODEX_APPSERVER_RESTART:=1}"
+: "${CODEX_APPSERVER_SOCKET:=${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock}"
+: "${CODEX_INFLIGHT_CMD:=}"
 
 # Only weekly_ceil, weekly_dead_zone, and the numeric helpers are reused from
 # the Claude library. Codex credentials use the functions below exclusively.
@@ -279,4 +282,51 @@ codex_write_usage() {
         rm -f "$tmp"
         return 1
     fi
+}
+
+# The app-server reads auth.json once, at startup, and caches the account for its
+# whole lifetime. A token swap therefore reaches no Codex work at all until the
+# process is replaced. On this box the app-server is spawned unmanaged by Codex
+# Desktop over SSH, so `codex app-server daemon restart` cannot manage it; killing
+# the process and letting Desktop respawn it on its next connect is the only lever.
+# It ignores SIGTERM, hence SIGKILL.
+codex_appserver_pid() {
+    if [ -n "${CODEX_APPSERVER_MOCK_DIR:-}" ]; then
+        [ -s "$CODEX_APPSERVER_MOCK_DIR/pid" ] || return 0
+        cat "$CODEX_APPSERVER_MOCK_DIR/pid"
+        return 0
+    fi
+    [ -n "$CODEX_APPSERVER_SOCKET" ] || return 0
+    ss -xlp 2>/dev/null | awk -v sock="$CODEX_APPSERVER_SOCKET" '
+        index($0, sock) > 0 && match($0, /pid=[0-9]+/) {
+            print substr($0, RSTART + 4, RLENGTH - 4)
+            exit
+        }'
+}
+
+# 0 killed, 2 nothing was running, 1 the kill failed.
+codex_kill_appserver() {
+    local pid
+    pid=$(codex_appserver_pid) || return 1
+    [ -n "$pid" ] || return 2
+    if [ -n "${CODEX_APPSERVER_MOCK_DIR:-}" ]; then
+        printf '%s\n' "$pid" >> "$CODEX_APPSERVER_MOCK_DIR/killed" || return 1
+        return 0
+    fi
+    kill -9 "$pid" 2>/dev/null || return 1
+}
+
+# 0 work is in flight, 1 the coast is clear, 2 the probe could not answer.
+# Callers must treat 2 exactly like 0: killing the app-server interrupts every
+# running turn, so an unanswerable probe is never a licence to swap, in the same
+# way an unknown usage reading never fires a trigger.
+codex_work_in_flight() {
+    local out rc
+    [ -n "$CODEX_INFLIGHT_CMD" ] || return 1
+    # Deliberately unquoted so the configured value may carry arguments.
+    # shellcheck disable=SC2086
+    out=$($CODEX_INFLIGHT_CMD 2>/dev/null)
+    rc=$?
+    [ "$rc" -ne 0 ] && return 2
+    [ -n "$out" ]
 }

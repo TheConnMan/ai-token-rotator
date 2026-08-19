@@ -177,8 +177,30 @@ setup_sandbox() {
     CONFIG="$SB/config.env"
     MOCK="$SB/wham"
     REFRESH="$SB/refresh"
-    mkdir -p "$STORE" "$(dirname "$AUTH")" "$MOCK" "$REFRESH"
+    APPSERVER="$SB/appserver"
+    mkdir -p "$STORE" "$(dirname "$AUTH")" "$MOCK" "$REFRESH" "$APPSERVER"
     chmod 700 "$STORE"
+    unset CODEX_INFLIGHT_CMD CODEX_APPSERVER_RESTART
+}
+
+# The app-server is a process boundary, mocked the same way the WHAM endpoint and
+# OAuth refresh are. "$APPSERVER/pid" is the pid the rotator should find; when it is
+# absent no app-server is running. Every kill the rotator performs appends to
+# "$APPSERVER/killed" instead of signalling a real process.
+set_appserver_pid() { printf '%s' "$1" > "$APPSERVER/pid"; }
+killed_pids() { cat "$APPSERVER/killed" 2>/dev/null; }
+
+# Writes an executable stub and points CODEX_INFLIGHT_CMD at it. The stub prints
+# "$1" (empty means no work in flight) and exits with "$2".
+set_inflight_cmd() {
+    local out="$1" rc="${2:-0}"
+    cat > "$SB/inflight.sh" <<EOF
+#!/usr/bin/env bash
+printf '%s' "$out"
+exit $rc
+EOF
+    chmod 700 "$SB/inflight.sh"
+    CODEX_INFLIGHT_CMD="$SB/inflight.sh"
 }
 
 seed_account() { make_token_store "$STORE/$1.tokens" "$2" "$3" "$1"; }
@@ -193,6 +215,9 @@ run_rotate() {
         ROTATOR_CONFIG="$CONFIG" \
         CODEX_USAGE_MOCK_DIR="$MOCK" \
         CODEX_REFRESH_MOCK_DIR="$REFRESH" \
+        CODEX_APPSERVER_MOCK_DIR="$APPSERVER" \
+        CODEX_INFLIGHT_CMD="${CODEX_INFLIGHT_CMD:-}" \
+        CODEX_APPSERVER_RESTART="${CODEX_APPSERVER_RESTART:-1}" \
             bash "$ROTATE" "$@" 2>&1
     )
     RC=$?
@@ -1199,6 +1224,197 @@ if [ ! -f "$ROTATE" ] || [ ! -f "$BOOTSTRAP" ]; then
     printf 'NOTE: Codex production scripts do not exist yet. Scenarios should fail.\n\n'
 fi
 
+# --- app-server restart on swap -------------------------------------------------
+# A swap only changes auth.json. The running app-server caches its account at
+# startup and never re-reads the file, so the swap does not reach any Codex work
+# until the app-server is replaced. Killing it is destructive to in-flight turns,
+# hence the in-flight gate below.
+
+scenario_swap_restarts_appserver() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+
+    run_rotate
+
+    assert_exit 0 "$RC" "restart-on-swap exit"
+    assert_active acctB "restart-on-swap still performed the swap"
+    assert_eq "4242" "$(killed_pids)" "swap killed the running app-server exactly once"
+    assert_contains "$OUT" "app-server" "swap logged the app-server restart"
+}
+
+scenario_no_appserver_running_is_not_an_error() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+
+    run_rotate
+
+    assert_exit 0 "$RC" "absent app-server exit"
+    assert_active acctB "absent app-server still performed the swap"
+    assert_eq "" "$(killed_pids)" "absent app-server killed nothing"
+}
+
+scenario_rolled_back_swap_leaves_appserver_alone() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    # Block the pointer write so the swap is attempted, fails, and rolls back.
+    # The live auth ends up back on acctA, so killing the app-server would
+    # restart it onto the account it was already serving and interrupt work
+    # for nothing.
+    mkdir "$STORE/active.tmp"
+
+    run_rotate
+
+    assert_exit 0 "$RC" "rolled back swap exit"
+    assert_active acctA "rolled back swap left the pointer alone"
+    assert_eq "accessA" "$(jq -r '.tokens.access_token // empty' "$AUTH" 2>/dev/null)" \
+        "rolled back swap restored the original live tokens"
+    assert_contains "$OUT" "SWAP FAILED" "rolled back swap logged the failure"
+    assert_eq "" "$(killed_pids)" "rolled back swap must not kill the app-server"
+}
+
+scenario_appserver_restart_can_be_disabled() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    CODEX_APPSERVER_RESTART=0
+
+    run_rotate
+
+    assert_exit 0 "$RC" "restart disabled exit"
+    assert_active acctB "restart disabled still performed the swap"
+    assert_eq "" "$(killed_pids)" "restart disabled killed nothing"
+}
+
+scenario_status_never_kills_appserver() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+
+    run_rotate status
+
+    assert_exit 0 "$RC" "status exit"
+    assert_active acctA "status did not swap"
+    assert_eq "" "$(killed_pids)" "status must never kill the app-server"
+}
+
+# --- in-flight gate -------------------------------------------------------------
+# Killing the app-server interrupts every running turn, so a swap must never fire
+# while Codex work is in flight.
+
+scenario_inflight_work_blocks_swap() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    set_inflight_cmd "thread-01a01adc"
+
+    run_rotate
+
+    assert_exit 0 "$RC" "in-flight gate exit"
+    assert_active acctA "in-flight work blocked the swap"
+    assert_eq "accessA" "$(jq -r '.tokens.access_token // empty' "$AUTH" 2>/dev/null)" \
+        "in-flight work left the live auth untouched"
+    assert_eq "" "$(killed_pids)" "in-flight work must not kill the app-server"
+    assert_contains "$OUT" "decision=HOLD" "in-flight work reported a hold"
+    assert_contains "$OUT" "in flight" "in-flight hold explained itself"
+}
+
+scenario_inflight_probe_failure_holds() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    # A probe that cannot answer is unknown, and unknown must never authorise a kill.
+    set_inflight_cmd "" 1
+
+    run_rotate
+
+    assert_exit 0 "$RC" "in-flight probe failure exit"
+    assert_active acctA "unknown in-flight state blocked the swap"
+    assert_eq "" "$(killed_pids)" "unknown in-flight state must not kill the app-server"
+}
+
+scenario_quiet_inflight_probe_allows_swap() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    set_inflight_cmd "" 0
+
+    run_rotate
+
+    assert_exit 0 "$RC" "quiet in-flight probe exit"
+    assert_active acctB "quiet in-flight probe allowed the swap"
+    assert_eq "4242" "$(killed_pids)" "quiet in-flight probe allowed the restart"
+}
+
+scenario_inflight_work_blocks_pinned_swap() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    set_pin acctB
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    set_inflight_cmd "thread-01a01adc"
+
+    run_rotate
+
+    assert_exit 0 "$RC" "pinned in-flight gate exit"
+    assert_active acctA "in-flight work blocked the pinned swap"
+    assert_eq "" "$(killed_pids)" "pinned in-flight work must not kill the app-server"
+}
+
 run_scenario "Bootstrap captures only auth tokens"              scenario_bootstrap_captures_only_tokens
 run_scenario "Real fetch builds secure WHAM headers"            scenario_fetch_usage_builds_secure_headers
 run_scenario "Unauthorized WHAM response fails usage fetch"     scenario_fetch_usage_rejects_unauthorized_response
@@ -1233,6 +1449,16 @@ run_scenario "Overlapping live tick holds rotate lock"            scenario_overl
 run_scenario "Install creates a parallel Codex timer"            scenario_install_creates_parallel_codex_timer
 run_scenario "Install fails when systemctl fails"                scenario_install_fails_when_systemctl_fails
 run_scenario "Install fails when timer enable fails"             scenario_install_fails_when_timer_enable_fails
+
+run_scenario "Swap restarts the app-server"                      scenario_swap_restarts_appserver
+run_scenario "Absent app-server is not an error"                 scenario_no_appserver_running_is_not_an_error
+run_scenario "Rolled back swap leaves the app-server alone"      scenario_rolled_back_swap_leaves_appserver_alone
+run_scenario "App-server restart can be disabled"                scenario_appserver_restart_can_be_disabled
+run_scenario "Status never kills the app-server"                 scenario_status_never_kills_appserver
+run_scenario "In-flight work blocks the swap"                    scenario_inflight_work_blocks_swap
+run_scenario "Unknown in-flight state blocks the swap"           scenario_inflight_probe_failure_holds
+run_scenario "Quiet in-flight probe allows the swap"             scenario_quiet_inflight_probe_allows_swap
+run_scenario "In-flight work blocks a pinned swap"               scenario_inflight_work_blocks_pinned_swap
 
 printf '\nCodex summary: %d passed, %d failed\n' "$PASS" "$FAILED"
 [ "$FAILED" -eq 0 ]
