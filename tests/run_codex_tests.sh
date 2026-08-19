@@ -8,6 +8,8 @@ set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 ROTATE="$REPO_ROOT/codex-rotate.sh"
+INFLIGHT="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")/codex-inflight.sh"
+FAKE_APPSERVER="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/fake-appserver.py"
 BOOTSTRAP="$REPO_ROOT/codex-bootstrap.sh"
 CODEX_LIB="$REPO_ROOT/codex-lib.sh"
 INSTALL="$REPO_ROOT/install.sh"
@@ -1415,6 +1417,91 @@ scenario_inflight_work_blocks_pinned_swap() {
     assert_eq "" "$(killed_pids)" "pinned in-flight work must not kill the app-server"
 }
 
+# --- app-server in-flight probe --------------------------------------------------
+# codex-inflight.sh is what makes the gate cover an external dispatcher, which records its
+# dispatches nowhere the rotator can see. It asks the app-server directly, so these
+# scenarios stand up a fake app-server rather than mocking the probe itself.
+
+start_fake_appserver() {
+    FAKE_SOCK="$SB/fake-app-server.sock"
+    python3 "$FAKE_APPSERVER" "$FAKE_SOCK" "$@" > "$SB/fake.out" 2>"$SB/fake.err" &
+    FAKE_PID=$!
+    local waited=0
+    while [ ! -s "$SB/fake.out" ] && [ "$waited" -lt 100 ]; do
+        waited=$((waited + 1))
+        read -r -t 0.1 < /dev/zero 2>/dev/null || true
+    done
+    [ -s "$SB/fake.out" ] || fail "fake app-server never became ready"
+}
+
+stop_fake_appserver() {
+    [ -n "${FAKE_PID:-}" ] && kill "$FAKE_PID" 2>/dev/null
+    wait "${FAKE_PID:-}" 2>/dev/null
+    FAKE_PID=""
+}
+
+run_inflight() {
+    OUT=$(CODEX_APPSERVER_SOCKET="${1:-$FAKE_SOCK}" ROTATOR_CONFIG="$CONFIG" \
+        bash "$INFLIGHT" 2>&1)
+    RC=$?
+}
+
+scenario_inflight_probe_reports_active_thread() {
+    make_config "acctA acctB"
+    start_fake_appserver active
+    run_inflight
+    stop_fake_appserver
+    assert_exit 0 "$RC" "active probe exit"
+    assert_contains "$OUT" "thread-0" "an active thread is reported as in flight"
+}
+
+scenario_inflight_probe_is_quiet_when_nothing_runs() {
+    make_config "acctA acctB"
+    # A completed turn leaves the thread loaded and idle, not evicted. Reporting that
+    # as in flight would wedge rotation permanently.
+    start_fake_appserver idle notLoaded
+    run_inflight
+    stop_fake_appserver
+    assert_exit 0 "$RC" "quiet probe exit"
+    assert_eq "" "$OUT" "idle and notLoaded threads are not in flight"
+}
+
+scenario_inflight_probe_holds_on_unknown_status() {
+    make_config "acctA acctB"
+    start_fake_appserver somethingNew
+    run_inflight
+    stop_fake_appserver
+    assert_exit 0 "$RC" "unknown status probe exit"
+    assert_contains "$OUT" "thread-0" "an unrecognised status is treated as in flight"
+}
+
+scenario_inflight_probe_reports_only_the_active_thread() {
+    make_config "acctA acctB"
+    start_fake_appserver notLoaded active idle
+    run_inflight
+    stop_fake_appserver
+    assert_exit 0 "$RC" "mixed probe exit"
+    assert_eq "thread-1" "$OUT" "only the active thread is reported"
+}
+
+scenario_inflight_probe_fails_loudly_on_rpc_error() {
+    make_config "acctA acctB"
+    start_fake_appserver --rpc-error
+    run_inflight
+    stop_fake_appserver
+    # Non-zero is the rotator's "unknown", which it treats as in flight.
+    if [ "$RC" -eq 0 ]; then
+        fail "an app-server RPC error must not report the coast is clear"
+    fi
+}
+
+scenario_inflight_probe_is_clear_without_an_appserver() {
+    make_config "acctA acctB"
+    run_inflight "$SB/definitely-not-a-socket"
+    assert_exit 0 "$RC" "absent socket exit"
+    assert_eq "" "$OUT" "no app-server means nothing can be in flight"
+}
+
 run_scenario "Bootstrap captures only auth tokens"              scenario_bootstrap_captures_only_tokens
 run_scenario "Real fetch builds secure WHAM headers"            scenario_fetch_usage_builds_secure_headers
 run_scenario "Unauthorized WHAM response fails usage fetch"     scenario_fetch_usage_rejects_unauthorized_response
@@ -1459,6 +1546,13 @@ run_scenario "In-flight work blocks the swap"                    scenario_inflig
 run_scenario "Unknown in-flight state blocks the swap"           scenario_inflight_probe_failure_holds
 run_scenario "Quiet in-flight probe allows the swap"             scenario_quiet_inflight_probe_allows_swap
 run_scenario "In-flight work blocks a pinned swap"               scenario_inflight_work_blocks_pinned_swap
+
+run_scenario "Probe reports an active thread"                     scenario_inflight_probe_reports_active_thread
+run_scenario "Probe is quiet when nothing runs"                  scenario_inflight_probe_is_quiet_when_nothing_runs
+run_scenario "Probe holds on an unknown status"                  scenario_inflight_probe_holds_on_unknown_status
+run_scenario "Probe reports only the active thread"              scenario_inflight_probe_reports_only_the_active_thread
+run_scenario "Probe fails loudly on an RPC error"                scenario_inflight_probe_fails_loudly_on_rpc_error
+run_scenario "Probe is clear without an app-server"              scenario_inflight_probe_is_clear_without_an_appserver
 
 printf '\nCodex summary: %d passed, %d failed\n' "$PASS" "$FAILED"
 [ "$FAILED" -eq 0 ]

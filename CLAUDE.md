@@ -79,6 +79,14 @@ Each of these exists because it broke something. Do not "simplify" one away.
   running turn, proven by a live mid-turn kill. `CODEX_INFLIGHT_CMD` gates it, and an
   unanswerable probe counts as in flight. Waiting one tick is cheap; killing a running
   job is not. The gate covers PIN forced swaps too.
+* **The in-flight probe asks the app-server, not a dispatcher's database.** Only the
+  app-server sees every running turn, so `codex-inflight.sh` covers an external dispatcher,
+  which records its dispatches nowhere the rotator can read. A the drain controller-only probe
+  would leave an external dispatcher jobs invisible and killable.
+* **`idle` is quiet, and the quiet set is what gets matched.** A completed turn leaves
+  its thread loaded as `idle`, not evicted. An early version reported anything that
+  was not `notLoaded` as in flight, which held every swap forever once any job had
+  run. Match the quiet set so an unrecognised status holds instead of killing.
 * **Only a fully successful swap kills the app-server.** On the rollback path the live
   auth is back on the account the app-server already serves, so a kill there would
   interrupt work to change nothing.
