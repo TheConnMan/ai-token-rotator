@@ -298,8 +298,15 @@ provider credentials. See `README.md` for operator setup.
   refresh or retry leaves usage unknown and never eligible to fire or target a normal
   trigger swap.
 4. If a returned five hour or weekly reset is already past, normalize that window to
-  zero usage without a synthetic run. An explicit `credits.has_credits=false` remains
-  exhausted.
+  zero usage without a synthetic run. A real rate limit window always wins over the
+  `credits` object: on a ChatGPT Plus or Pro plan `credits.has_credits=false` means no
+  pay as you go top up balance and says nothing about the plan's included weekly quota.
+  `credits.has_credits=false` marks the account exhausted ONLY in the windowless shape,
+  where neither window is present and no other signal exists.
+4a. A window that is absent or unreadable is UNKNOWN, never zero. These plans ship no
+  five hour window at all, and the weekly window arrives in either the primary or the
+  secondary slot, so identify windows by `limit_window_seconds` across both slots. A
+  zero would read as maximum headroom and win every comparison.
 5. The existing `weekly_ceil` resolver and `WEEKLY_CEIL_<label>` configuration govern
   Codex Trigger C and PIN ceiling behavior too. Matching labels therefore use the
   same weekly ceiling across providers.

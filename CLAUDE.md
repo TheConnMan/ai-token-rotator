@@ -60,6 +60,17 @@ Each of these exists because it broke something. Do not "simplify" one away.
   or the sync overwrites the active slot with another account's credentials.
 * **`ENABLED` sentinel gates live runs.** Without it, a live tick exits writing nothing.
   `rotate.sh status` is always a dry read and must never write or swap.
+* **Codex usage: a real window beats the `credits` object.** `credits.has_credits=false`
+  is normal on a ChatGPT Plus/Pro plan (it means no pay-as-you-go top-up) and says nothing
+  about the included weekly quota. Reading credits first reported a brand-new subscription
+  at 1% as fully spent, so the rotator would never swap onto it. Credits decide only in the
+  windowless `premium` shape, where no window exists to read.
+* **A missing usage window is unknown, never zero.** These plans ship no 5h window at all,
+  and the weekly window can arrive in either the `primary_window` or `secondary_window`
+  slot, so match on `limit_window_seconds`. Requiring both windows made every healthy
+  account read as unknown; defaulting a missing one to zero would make it win every
+  comparison.
+
 * **N=1 is a monitored no-op**, reached naturally through the normal decision path
   rather than by an early return.
 
