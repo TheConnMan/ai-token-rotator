@@ -330,6 +330,17 @@ provider credentials. See `README.md` for operator setup.
   work is in flight. An unset probe disables the gate. A probe that exits non-zero is
   UNKNOWN and counts as in flight, because an unanswerable probe is never a licence
   to kill a job. The gate covers PIN forced swaps too.
+10a. `codex-inflight.sh` is that probe. It asks the app-server itself, via
+  `thread/list`, which threads are running. The app-server is the only component that
+  sees every turn, so one probe covers an external dispatcher, the drain controller, the CLI dispatcher and
+  Codex Desktop without any dispatcher registering its work anywhere. This matters
+  most for an external dispatcher, which records nothing the rotator could otherwise read.
+  A thread counts as quiet only when its status is `idle` or `notLoaded`; every other
+  status, known or not, holds the swap. Matching the quiet set rather than matching
+  `active` is deliberate: an unrecognised status must hold rather than authorise a
+  kill. A completed turn stays loaded as `idle`, so `idle` MUST be in the quiet set,
+  or rotation wedges permanently. No app-server at all means nothing can be running,
+  which is a real answer and not an unknown.
 11. The app-server is killed only after the pointer write succeeds. An aborted or
   rolled back swap leaves it running, since the live auth is back on the account it
   was already serving.
