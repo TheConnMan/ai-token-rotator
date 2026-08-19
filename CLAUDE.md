@@ -70,7 +70,6 @@ Each of these exists because it broke something. Do not "simplify" one away.
   slot, so match on `limit_window_seconds`. Requiring both windows made every healthy
   account read as unknown; defaulting a missing one to zero would make it win every
   comparison.
-
 * **N=1 is a monitored no-op**, reached naturally through the normal decision path
   rather than by an early return.
 
