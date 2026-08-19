@@ -319,3 +319,17 @@ provider credentials. See `README.md` for operator setup.
 7. With one configured Codex account, the tick still polls and logs but never swaps.
 8. Codex status is read only. It never refreshes, writes usage or logs,
   swaps auth, updates the pointer, or otherwise mutates provider state.
+9. A swap alone reaches no Codex work. The app-server reads `auth.json` once at
+  startup and caches that account for its whole lifetime, so the rotator kills the
+  app-server after a swap that fully succeeded. It respawns on the next Codex
+  Desktop connect and reads the new account then. `CODEX_APPSERVER_RESTART=0`
+  disables the kill. The process ignores SIGTERM, so the kill is SIGKILL, and it is
+  located by the pid listening on `CODEX_APPSERVER_SOCKET`.
+10. Killing the app-server interrupts every running turn, so no swap fires while
+  Codex work is in flight. `CODEX_INFLIGHT_CMD` is the probe: non-empty stdout means
+  work is in flight. An unset probe disables the gate. A probe that exits non-zero is
+  UNKNOWN and counts as in flight, because an unanswerable probe is never a licence
+  to kill a job. The gate covers PIN forced swaps too.
+11. The app-server is killed only after the pointer write succeeds. An aborted or
+  rolled back swap leaves it running, since the live auth is back on the account it
+  was already serving.

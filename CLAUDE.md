@@ -70,6 +70,18 @@ Each of these exists because it broke something. Do not "simplify" one away.
   slot, so match on `limit_window_seconds`. Requiring both windows made every healthy
   account read as unknown; defaulting a missing one to zero would make it win every
   comparison.
+* **A swap must restart the app-server.** The app-server reads `auth.json` once at
+  startup and caches that account forever, so a swap alone reaches no Codex work at
+  all. It is spawned unmanaged by Codex Desktop over SSH, so `codex app-server daemon
+  restart` cannot manage it, and it ignores SIGTERM. SIGKILL plus Desktop's respawn is
+  the only lever, verified 2026-08-19 in both directions.
+* **Never swap while Codex work is in flight.** The restart above interrupts every
+  running turn, proven by a live mid-turn kill. `CODEX_INFLIGHT_CMD` gates it, and an
+  unanswerable probe counts as in flight. Waiting one tick is cheap; killing a running
+  job is not. The gate covers PIN forced swaps too.
+* **Only a fully successful swap kills the app-server.** On the rollback path the live
+  auth is back on the account the app-server already serves, so a kill there would
+  interrupt work to change nothing.
 * **N=1 is a monitored no-op**, reached naturally through the normal decision path
   rather than by an early return.
 
