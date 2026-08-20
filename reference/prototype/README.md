@@ -1,4 +1,8 @@
-# Claude Max two-account OAuth token rotator
+# Claude Max two-account OAuth token rotator (superseded prototype)
+
+> Kept for reference only. This is the original two-account prototype that the
+> N-account rotator at the repository root replaced; the `services/token-rotator/`
+> paths below are from where it originally lived. Do not run it.
 
 Swaps the live Claude Code credentials file between two logged-in Claude Max
 accounts so a single machine can spread its work across both weekly limits.
@@ -46,8 +50,9 @@ Dry read-out (never swaps): `services/token-rotator/rotate.sh status`
 
 ## Notes
 
-- The statusline and the drain controller usage percentages reflect whichever account is
-  currently active, since they read the same live credentials file.
+- Any other tool that reads the live credentials file (a statusline, a usage
+  reporter) reflects whichever account is currently active, since it is reading the
+  same file the rotator swaps.
 
 ## Safety
 

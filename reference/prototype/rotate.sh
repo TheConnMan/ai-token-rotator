@@ -4,7 +4,7 @@
 # usage is lopsided. `rotate.sh status` does a dry read-out and never writes/swaps.
 #
 # Utilization is on a 0-100 scale (Anthropic OAuth usage endpoint, matching
-# the drain controller). Trigger A: active 5h utilization >= 80. Trigger B: active weekly
+# background drain tooling). Trigger A: active 5h utilization >= 80. Trigger B: active weekly
 # minus other weekly >= 10 percentage points.
 set -uo pipefail
 

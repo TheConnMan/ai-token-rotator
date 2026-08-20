@@ -1,6 +1,6 @@
 # claude-token-rotator SPEC
 
-This file is the full acceptance criteria. There is no Linear ticket. Build it test-first.
+This file is the full acceptance criteria and the behavioral contract. Build it test-first.
 
 ## Purpose
 
@@ -68,7 +68,7 @@ suite never touches the real `~/.claude`:
   admission check and nothing meters mid-job, so work admitted at 99 overruns and hard-fails
 - `ACCOUNTS="acctA acctB"`     space-separated labels; N accounts
 
-## Usage endpoint (reuse this exact shape; see reference/prototype and the drain controller usage.sh)
+## Usage endpoint (reuse this exact shape; see `reference/prototype`)
 
 `GET https://api.anthropic.com/api/oauth/usage`
 Headers: `Authorization: Bearer <that account's accessToken>`,
@@ -332,9 +332,9 @@ provider credentials. See `README.md` for operator setup.
   to kill a job. The gate covers PIN forced swaps too.
 10a. `codex-inflight.sh` is that probe. It asks the app-server itself, via
   `thread/list`, which threads are running. The app-server is the only component that
-  sees every turn, so one probe covers an external dispatcher, the drain controller, the CLI dispatcher and
-  Codex Desktop without any dispatcher registering its work anywhere. This matters
-  most for an external dispatcher, which records nothing the rotator could otherwise read.
+  sees every turn, so one probe covers Codex Desktop, the CLI, and any external
+  dispatcher without any of them registering work anywhere. This matters most for
+  dispatchers that keep no record the rotator could otherwise read.
   A thread counts as quiet only when its status is `idle` or `notLoaded`; every other
   status, known or not, holds the swap. Matching the quiet set rather than matching
   `active` is deliberate: an unrecognised status must hold rather than authorise a

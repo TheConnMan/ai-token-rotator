@@ -1,8 +1,12 @@
-# Real config with account labels stays local; commit config.env.example instead
-config.env
+# Real config with account labels stays local; commit config.env.example instead.
+# The glob also catches local backups (config.env.bak, config.env.local, ...).
+config.env*
+!config.env.example
 
 # Never commit anything resembling credentials or the runtime store
 *.credentials.json
+*.tokens
+auth.json
 accounts/
 *.log
 

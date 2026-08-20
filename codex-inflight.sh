@@ -2,10 +2,10 @@
 # Report Codex work that is in flight right now, one thread id per line.
 #
 # The app-server is the only component that knows about every running turn. Its
-# threads come from an external dispatcher, the drain controller, the CLI dispatcher and Codex Desktop
-# alike, so asking it directly covers all of them without any dispatcher having to
-# register its work anywhere. That is what makes this safe for an external dispatcher, which
-# records nothing in the the drain controller database.
+# threads come from Codex Desktop, the CLI, and any external dispatcher alike, so
+# asking it directly covers all of them without any dispatcher having to register its
+# work anywhere. That matters for dispatchers that keep no record the rotator could
+# otherwise read.
 #
 # Contract expected by CODEX_INFLIGHT_CMD:
 #   stdout non-empty, exit 0 -> work is in flight, do not swap

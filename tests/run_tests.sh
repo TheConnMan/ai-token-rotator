@@ -1380,7 +1380,7 @@ scenario_pin_unconfigured_label_holds() {
 }
 
 # Weekly-exhaustion escape valve: while pinned, if the PINNED account's weekly is
-# KNOWN and >= WEEKLY_PIN_RELEASE_PCT (default 98), the tick DEGRADES to normal
+# KNOWN and >= that account's own WEEKLY_CEIL (default 98), the tick DEGRADES to normal
 # rotation (Trigger A/B run as if unpinned) without deleting $STORE/PIN. active=acctA
 # is pinned with weekly=98 (exactly the boundary; inclusive release at the default);
 # acctB is far lower weekly (10). Under the release the divergence (98-10=88 >= 20)

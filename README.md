@@ -68,7 +68,7 @@ share credential material with the Claude store. The Codex store is
 `$CODEX_ROTATOR_STORE`, defaulting to `~/.codex/accounts`.
 
 Labels are shared human names across providers, not shared credentials. For example,
-`Personal` may identify one Claude credential and a different Codex credential. List
+`acctA` may identify one Claude credential and a different Codex credential. List
 Codex labels separately in `CODEX_ACCOUNTS` in `config.env`, even when the labels
 match `ACCOUNTS`.
 
@@ -235,12 +235,40 @@ working mid-week. So give an account you also use interactively a ceiling below 
 let an account reserved for background work sit near 100:
 
 ```sh
-WEEKLY_CEIL_acctA=95   # keep 5% for the mobile and desktop apps
+WEEKLY_CEIL_acctA=95   # also used interactively; keep 5% for the mobile and desktop apps
 WEEKLY_CEIL_acctB=99   # background work only, drain it
 ```
 
 Do not set a ceiling of exactly 100. Consumers treat it as an admission check and nothing
 meters mid-job, so work admitted at 99 runs past 100 and fails hard.
+
+## Pinning an account
+
+Writing a configured label into `$ROTATOR_STORE/PIN` forces the rotator onto that
+account and suspends Triggers A and B, so an external controller can keep a batch of
+work on one account for as long as it needs:
+
+```
+echo acctB > "$ROTATOR_STORE/PIN"   # force acctB
+rm "$ROTATOR_STORE/PIN"             # release
+```
+
+While the file exists the tick reports `decision=PINNED`, which is distinct from
+`HOLD` (no trigger fired). Details worth knowing:
+
+- **The writer owns cleanup.** `rotate.sh` never deletes `PIN`, so a pin left behind
+  pins forever. Whatever writes the file is responsible for removing it.
+- **A pin on a capped account is released for that tick.** If the pinned account is at
+  or above its own `WEEKLY_CEIL_<label>`, the tick degrades to normal rotation. The
+  `PIN` file is left in place, so the pin resumes once that account's weekly resets.
+- **An unconfigured or empty pin holds on the current account** and still reports
+  `PINNED`, rather than stranding the pointer on an account the rotator never polls.
+- Codex has its own independent `PIN` in `$CODEX_ROTATOR_STORE`.
+
+If an external controller enforces its own drain ceiling, keep it equal to this
+rotator's ceiling for the same account. When the two disagree, one system reads a
+mid-drain account as exhausted while the other reads it as healthy, and work gets
+routed away from an account that still has budget.
 
 ## Decision rule
 
@@ -307,3 +335,70 @@ rm "$ROTATOR_STORE/ENABLED"       # pause rotation
 ./bootstrap.sh <label>            # recapture + realign the pointer
 touch "$ROTATOR_STORE/ENABLED"    # resume rotation
 ```
+
+## Logs and troubleshooting
+
+Every tick appends one timestamped decision line to `$ROTATOR_STORE/rotate.log`
+(Codex writes to `$CODEX_ROTATOR_STORE/rotate.log`):
+
+```
+tail -f ~/.claude/accounts/rotate.log
+tail -f ~/.codex/accounts/rotate.log
+./rotate.sh status                      # dry read-out, never writes or swaps
+./codex-rotate.sh status
+systemctl --user list-timers 'cc-*token-rotator*'
+journalctl --user -u cc-token-rotator.service -n 50
+```
+
+Common cases:
+
+- **Nothing in the log at all.** The `ENABLED` sentinel is missing, so every tick
+  exits immediately. `touch "$ROTATOR_STORE/ENABLED"`.
+- **`Trigger:n/a`, or the log stops for hours.** The timer is not firing. Check
+  `systemctl --user list-timers`, and on a headless box confirm
+  `loginctl enable-linger "$USER"` so user units survive logout.
+- **An account's usage reads as unknown.** Its idle token could not be refreshed or
+  polled. Unknown is never treated as zero: the account fires no trigger and is never
+  a swap target, so rotation continues safely on the accounts that do report.
+- **The pointer disagrees with reality** after an out-of-band `/login`. See
+  "Active-pointer desync recovery" above.
+- **A Codex swap did not reach running work.** The Codex app-server caches its account
+  at startup, so `CODEX_APPSERVER_RESTART=1` is what makes a swap take effect. The
+  restart is deliberately blocked while `CODEX_INFLIGHT_CMD` reports work in flight,
+  so a busy box can hold on the same account for several ticks.
+
+## Uninstall
+
+```
+rm -f "$ROTATOR_STORE/ENABLED" "$CODEX_ROTATOR_STORE/ENABLED"   # stop rotating
+systemctl --user disable --now cc-token-rotator.timer cc-codex-token-rotator.timer
+rm -f ~/.config/systemd/user/cc-token-rotator.{service,timer} \
+      ~/.config/systemd/user/cc-codex-token-rotator.{service,timer}
+systemctl --user daemon-reload
+```
+
+The store is left alone; delete `~/.claude/accounts` and `~/.codex/accounts` yourself
+once you are sure you no longer want the captured credentials.
+
+## Security
+
+This tool moves real OAuth credentials around your machine. What that means in
+practice:
+
+- **The store holds live credentials.** `<label>.json`, `mcp.json`, and the Codex
+  `<label>.tokens` files contain usable access and refresh tokens. The store is
+  created outside the repository (default `~/.claude/accounts` and `~/.codex/accounts`)
+  with directory mode 0700 and file mode 0600, enforced by explicit `chmod`s on every
+  write plus a `umask 077`, so nothing it writes is readable by another user.
+- **Never move the store inside the repository.** Point `ROTATOR_STORE` at a path a
+  git working tree does not cover. `.gitignore` blocks the obvious names as a
+  backstop, not as the primary control.
+- **The real `config.env` is gitignored** because it names your accounts. Only
+  `config.env.example` is committed.
+- **Nothing is sent anywhere but the provider.** The only network calls are the
+  Anthropic OAuth usage endpoint, the Codex usage endpoint, and `auth.openai.com` for
+  a Codex token refresh, each with that account's own bearer token.
+- **This runs on your own logged-in accounts.** It performs no login, bypasses no
+  limit, and creates no accounts: it swaps between accounts you already authenticated
+  yourself. Check that pooling your own subscriptions this way is consistent with the
+  terms you agreed to.

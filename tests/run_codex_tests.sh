@@ -1418,8 +1418,8 @@ scenario_inflight_work_blocks_pinned_swap() {
 }
 
 # --- app-server in-flight probe --------------------------------------------------
-# codex-inflight.sh is what makes the gate cover an external dispatcher, which records its
-# dispatches nowhere the rotator can see. It asks the app-server directly, so these
+# codex-inflight.sh is what makes the gate cover dispatchers that record their work
+# nowhere the rotator can see. It asks the app-server directly, so these
 # scenarios stand up a fake app-server rather than mocking the probe itself.
 
 start_fake_appserver() {

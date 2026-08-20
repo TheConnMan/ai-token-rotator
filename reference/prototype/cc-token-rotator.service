@@ -3,4 +3,4 @@ Description=Claude Max two-account OAuth token rotator (no-ops until accounts/EN
 
 [Service]
 Type=oneshot
-ExecStart=%h/ai-token-rotator/rotate.sh
+ExecStart=%h/claude-token-rotator/rotate.sh

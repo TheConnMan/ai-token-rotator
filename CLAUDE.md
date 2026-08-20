@@ -80,9 +80,9 @@ Each of these exists because it broke something. Do not "simplify" one away.
   unanswerable probe counts as in flight. Waiting one tick is cheap; killing a running
   job is not. The gate covers PIN forced swaps too.
 * **The in-flight probe asks the app-server, not a dispatcher's database.** Only the
-  app-server sees every running turn, so `codex-inflight.sh` covers an external dispatcher,
-  which records its dispatches nowhere the rotator can read. A the drain controller-only probe
-  would leave an external dispatcher jobs invisible and killable.
+  app-server sees every running turn, so `codex-inflight.sh` covers every Codex client
+  on the box at once. A probe scoped to one dispatcher's own records would leave every
+  other dispatcher's jobs invisible and killable.
 * **`idle` is quiet, and the quiet set is what gets matched.** A completed turn leaves
   its thread loaded as `idle`, not evicted. An early version reported anything that
   was not `notLoaded` as in flight, which held every swap forever once any job had
@@ -93,7 +93,7 @@ Each of these exists because it broke something. Do not "simplify" one away.
 * **N=1 is a monitored no-op**, reached naturally through the normal decision path
   rather than by an early return.
 
-## PIN, and the the drain controller coupling
+## PIN, and the external-controller coupling
 
 `$STORE/PIN` holds an account label. While present, the rotator forces `active` to that
 account and suspends Triggers A and B, emitting `decision=PINNED`. `PINNED` is distinct
@@ -103,13 +103,13 @@ from `HOLD`, which only means no trigger fired this tick.
   label this rotator does not manage would strand `active` on an account later ticks
   never poll.
 * **The writer owns PIN cleanup.** A stale PIN pins forever by design. `rotate.sh` never
-  deletes the file, including when the weekly-exhaustion escape valve
-  (`WEEKLY_PIN_RELEASE_PCT`) degrades a tick to normal rotation.
-* The writer today is the drain controller in the `<private-repo>` repo
-  (`an external controller`), which pins the account it is draining immediately
-  before each batch and clears the pin between batches.
+  deletes the file, including when the pinned account reaches its own
+  `WEEKLY_CEIL_<label>` and the tick degrades to normal rotation.
+* The writer is whatever external controller you point at the store. A batch runner that
+  wants its work kept on one account pins that label before each batch and clears the pin
+  between batches. Nothing in this repo ever writes `PIN`.
 
-`WEEKLY_PIN_RELEASE_PCT` (98) intentionally matches the drain controller's `DRAIN_UNTIL_PCT` and
-an external dispatcher's `hard_ceiling_pct`. **Keep all three equal.** When they diverge, a
-mid-drain account reads as exhausted to one system and as healthy to another, and work
-gets routed away from accounts that still have budget.
+When an external controller has its own drain ceiling, **keep it equal to this rotator's
+`WEEKLY_CEIL_<label>` for the same account.** When the two diverge, a mid-drain account
+reads as exhausted to one system and as healthy to the other, and work gets routed away
+from accounts that still have budget.
