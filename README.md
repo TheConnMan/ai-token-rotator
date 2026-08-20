@@ -1,41 +1,59 @@
-# claude-token-rotator
+# ai-token-rotator
 
-**Seamlessly pool multiple Claude subscriptions as one.** If you have two or more
-Claude accounts, each with its own subscription, this rotates the account Claude
-Code is actively using so your work automatically runs against whichever account
-still has budget. When one account hits its 5-hour or weekly limit, the rotator
-hot-swaps to a fresher one within seconds, with no manual `/login` and no
+**Seamlessly pool multiple AI coding subscriptions as one.** If you have two or more
+accounts with an AI coding tool, each with its own subscription, this rotates the
+account the tool is actively using so your work automatically runs against whichever
+account still has budget. When one account hits its 5-hour or weekly limit, the
+rotator hot-swaps to a fresher one within seconds, with no manual re-login and no
 interruption to running jobs. It is built for unattended, long-running background
 work that would otherwise stall the moment a single account runs out.
 
-It works by rotating the active Claude Code OAuth account across your logged-in
-accounts, hot-swapping `~/.claude/.credentials.json` on a systemd user timer.
-Claude Code re-reads `.credentials.json` on nearly every API call, so atomically
-rewriting the account token in that file redirects even already-running jobs
-within seconds. With one account this is a monitored no-op; it starts rotating
-the moment a second account is bootstrapped. See `SPEC.md` for the full behavior
-and acceptance criteria.
+## Supported providers
+
+Each provider rotates independently, with its own credential file, store, active
+pointer, `ENABLED` sentinel, systemd service, and timer. Enable one or both.
+
+| Provider | Rotates | Store | Scripts |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude/.credentials.json` | `$ROTATOR_STORE` (default `~/.claude/accounts`) | `rotate.sh`, `bootstrap.sh` |
+| Codex | `~/.codex/auth.json` | `$CODEX_ROTATOR_STORE` (default `~/.codex/accounts`) | `codex-rotate.sh`, `codex-bootstrap.sh` |
+
+The unprefixed scripts are the Claude provider; every Codex counterpart carries a
+`codex-` prefix. The two share only `config.env` and this repo's decision logic, never
+credential material. Labels are shared human names across providers, not shared
+credentials: `acctA` may name one Claude account and a different Codex account.
+
+Both providers work the same way. A pointer file records which account is live, a
+systemd user timer ticks every `INTERVAL_MIN` minutes, and a tick swaps the stored
+token for another account into the live credential file when a trigger fires. Claude
+Code re-reads `.credentials.json` on nearly every API call, so a swap redirects even
+already-running Claude jobs within seconds; Codex caches its account in a long-lived
+app-server, so a Codex swap additionally restarts that app-server once no work is in
+flight (see "Codex account rotation"). With one account a provider is a monitored
+no-op; it starts rotating the moment a second account is bootstrapped. See `SPEC.md`
+for the full behavior and acceptance criteria.
 
 ## Requirements
 
 - **Linux with systemd** (the scheduler is a systemd *user* timer).
-- **Claude Code** installed and working.
-- **Codex** installed and working when rotating Codex accounts.
-- **Two or more Claude accounts**, each with an active subscription, that you can
-  `/login` to in Claude Code. (One account works too; it just runs as a monitored
-  no-op until you add a second.)
+- **At least one supported tool** installed and working: Claude Code, Codex, or both.
+- **Two or more accounts for that tool**, each with an active subscription, that you
+  can log into normally (`/login` in Claude Code, `codex login` for Codex). One
+  account works too; that provider just runs as a monitored no-op until you add a
+  second.
 - **`jq`**, **`curl`**, and **`flock`** on `PATH` (`bash`, `awk`, `date`, `stat`, `mktemp` are
   standard). On Debian/Ubuntu: `sudo apt install jq curl`.
 
 ## Quick start
 
-Pointing an agent at this repo? Hand it this README plus `SPEC.md` (the SPEC is the
-full behavioral contract) and it has everything it needs. To set up by hand:
+This walks through the Claude provider; "Codex setup" below is the same shape with
+`codex-` prefixed scripts. Pointing an agent at this repo? Hand it this README plus
+`SPEC.md` (the SPEC is the full behavioral contract) and it has everything it needs.
 
 ```
 # 1. Clone and enter the repo
-git clone https://github.com/TheConnMan/claude-token-rotator.git
-cd claude-token-rotator
+git clone https://github.com/TheConnMan/ai-token-rotator.git
+cd ai-token-rotator
 
 # 2. Create your config and list the account labels you will use
 cp config.env.example config.env
@@ -62,15 +80,10 @@ timer is safe at any point: `rotate.sh` no-ops until the `ENABLED` sentinel exis
 
 ## Codex account rotation
 
-Codex rotation runs beside Claude rotation, with its own credentials, store, active
-pointer, sentinel, service, and timer. It rotates `~/.codex/auth.json`; it does not
-share credential material with the Claude store. The Codex store is
-`$CODEX_ROTATOR_STORE`, defaulting to `~/.codex/accounts`.
-
-Labels are shared human names across providers, not shared credentials. For example,
-`acctA` may identify one Claude credential and a different Codex credential. List
-Codex labels separately in `CODEX_ACCOUNTS` in `config.env`, even when the labels
-match `ACCOUNTS`.
+Codex rotation is fully independent of Claude rotation and can be run on its own.
+It rotates `~/.codex/auth.json` and shares no credential material with the Claude
+store. List Codex labels separately in `CODEX_ACCOUNTS` in `config.env`, even when
+those labels match `ACCOUNTS`.
 
 The Codex store contains the following raw files:
 
@@ -121,7 +134,7 @@ Trigger C ceiling decisions. The same label therefore has the same configured ce
 for Claude and Codex. Separate provider ceilings remain a future design decision.
 With one Codex account, `codex-rotate.sh` still polls and logs but never swaps.
 
-## How it works
+## How it works: Claude
 
 Only the Claude account token (`.claudeAiOauth`) is swapped. The third-party MCP
 tokens (`.mcpOAuth`) are account-independent, so they live permanently in the live
@@ -154,7 +167,7 @@ The store must live OUTSIDE the repo (default `~/.claude/accounts`) so the
 credential material it holds is never committable. The real `config.env` also
 lives outside version control (gitignored).
 
-## Bootstrap flow
+## Bootstrap flow: Claude
 
 MCP tokens are account-independent, so you authenticate your MCP servers ONCE, on
 your first account, and every other account reuses that shared set.

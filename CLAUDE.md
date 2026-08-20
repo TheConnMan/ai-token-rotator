@@ -1,8 +1,10 @@
-# claude-token-rotator
+# ai-token-rotator
 
-Systemd-timer utility that hot-swaps the active Claude account token in
-`~/.claude/.credentials.json` across N bootstrapped accounts. Read `SPEC.md` for the
-full behavior contract and `README.md` for setup before changing anything.
+Systemd-timer utility that hot-swaps the active account of an AI coding tool across N
+bootstrapped accounts. Two independent providers: Claude Code (`rotate.sh`,
+`~/.claude/.credentials.json`) and Codex (`codex-rotate.sh`, `~/.codex/auth.json`).
+Unprefixed scripts are the Claude provider. Read `SPEC.md` for the full behavior
+contract and `README.md` for setup before changing anything.
 
 ## Git workflow
 

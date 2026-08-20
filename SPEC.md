@@ -1,14 +1,18 @@
-# claude-token-rotator SPEC
+# ai-token-rotator SPEC
 
 This file is the full acceptance criteria and the behavioral contract. Build it test-first.
 
 ## Purpose
 
-Automatically rotate the active Claude Code OAuth account across N logged-in Max
-accounts by hot-swapping `~/.claude/.credentials.json`, so unattended background
-work keeps running against whichever account has budget. Driven by a systemd user
-timer. With one account it is a monitored no-op; it starts rotating the moment a
-second account is bootstrapped.
+Automatically rotate the active account of an AI coding tool across N logged-in
+accounts, so unattended background work keeps running against whichever account has
+budget. Driven by a systemd user timer. With one account it is a monitored no-op; it
+starts rotating the moment a second account is bootstrapped.
+
+Two providers are in scope and rotate independently, sharing decision logic and
+`config.env` but no credential material: Claude Code (hot-swapping
+`~/.claude/.credentials.json`) and Codex (hot-swapping `~/.codex/auth.json`). Every
+section below specifies the Claude provider unless it says Codex.
 
 ## Verified mechanism (do not re-litigate)
 

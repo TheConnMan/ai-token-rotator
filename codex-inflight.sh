@@ -96,7 +96,7 @@ try:
     if b"101" not in response.split(b"\r\n", 1)[0]:
         raise RuntimeError("app-server refused the websocket upgrade")
     rpc(sock, 1, "initialize", {
-        "clientInfo": {"name": "claude-token-rotator", "title": "rotator inflight probe",
+        "clientInfo": {"name": "ai-token-rotator", "title": "rotator inflight probe",
                        "version": "1"},
         "capabilities": {"experimentalApi": True}})
     threads = rpc(sock, 2, "thread/list", {}).get("data", []) or []

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Plain-bash test suite for the claude-token-rotator.
+# Plain-bash test suite for the ai-token-rotator (Claude provider).
 #
 # Runs the REAL rotate.sh (repo root) as a subprocess against throwaway temp
 # sandboxes. It NEVER touches the real ~/.claude: every scenario points
