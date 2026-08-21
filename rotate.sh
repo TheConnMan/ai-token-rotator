@@ -185,8 +185,8 @@ for label in "${ACCT_ARR[@]}"; do
     fi
 
     if [ -n "$resp" ] && printf '%s' "$resp" | jq -e '.five_hour' >/dev/null 2>&1; then
-        FIVE[$label]=$(printf '%s' "$resp" | jq -r '.five_hour.utilization // empty')
-        WEEK[$label]=$(printf '%s' "$resp" | jq -r '.seven_day.utilization // empty')
+        FIVE[$label]=$(maybe_usage_pct "$(printf '%s' "$resp" | jq -r '.five_hour.utilization // empty')")
+        WEEK[$label]=$(maybe_usage_pct "$(printf '%s' "$resp" | jq -r '.seven_day.utilization // empty')")
         [ "$DRY" -eq 0 ] && write_usage "$label" "$resp"
     fi
     # No stale-usage fallback: a failed poll leaves this account UNKNOWN (empty),

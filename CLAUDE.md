@@ -51,9 +51,11 @@ Each of these exists because it broke something. Do not "simplify" one away.
 * **Never refresh the ACTIVE account's token.** The live client owns its refresh-token
   rotation, and racing it can invalidate a running session. Poll the active account
   with the live file's token, or with the statusline mirror when it is fresh.
-* **Unknown usage never fires a trigger and is never a trigger target.** A failed poll
-  leaves an account empty, not zero. Zero would read as maximum headroom and win every
-  comparison.
+* **Unknown usage never fires a trigger and is never a trigger target.** A failed poll,
+  or a missing/non-numeric/out-of-range utilization, leaves an account empty, not zero.
+  Zero would read as maximum headroom and win every comparison. The statusline mirror
+  is ignored unless it is owned by this uid, not world-writable, and both percentages
+  are numeric 0-100.
 * **Trigger B excludes 5h-pressured accounts from its target set.** Parking the pointer
   on a pressured account trips Trigger A on the next tick and bounces straight back, a
   stateless per-tick flap. This exclusion is the fix; do not drop it.

@@ -144,6 +144,7 @@ make_mirror() {
     local path="$1" p5="$2" p7="$3" wreset="$4" age="${5:-0}"
     printf '{"five_hour_pct":%s,"five_hour_reset":0,"seven_day_pct":%s,"seven_day_reset":%s}\n' \
         "$p5" "$p7" "$wreset" > "$path"
+    chmod 600 "$path"
     if [ "$age" -gt 0 ]; then
         touch -d "@$(( $(date +%s) - age ))" "$path"
     fi
@@ -914,6 +915,79 @@ scenario_mirror_no_anchor_falls_back_to_poll() {
     assert_cred_token "$CRED" "tok-acctB" "mirror-no-anchor live cred is acctB"
 }
 
+# Non-numeric utilization is UNKNOWN, never 0. jq -r leaves "n/a" as a non-empty
+# string, so current code treats acctC as a known 5h and will swap onto it when
+# it is the only other candidate. After ingest, n/a is empty: Trigger A fires
+# with no valid target and we HOLD. A numeric acctB is present so a regression
+# that coerces n/a to 0 (maximum headroom) would swap onto acctC instead of
+# acctB and fail the active-pointer assert.
+scenario_non_numeric_utilization_is_unknown() {
+    make_config "$CONFIG" "acctA acctB acctC"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    seed_account acctC "tok-acctC"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 10
+    make_mock "$MOCK" "tok-acctB" 60 10
+    make_mock "$MOCK" "tok-acctC" '"n/a"' 10
+
+    run_rotate
+    assert_exit 0 "$RC" "non-numeric-utilization exits 0"
+    assert_eq "acctB" "$(active_label)" "non-numeric 5h on acctC is UNKNOWN, not 0; Trigger A target=acctB(60)"
+    assert_cred_token "$CRED" "tok-acctB" "non-numeric-utilization live cred is acctB"
+    if ! grep -Fq 'acctC(5h=?' "$STORE/rotate.log"; then
+        fail "non-numeric 5h on acctC should log as unknown (?), not n/a or 0"
+    fi
+}
+
+# Partial identity-matched mirror (5h present, seven_day_pct omitted) must be
+# ignored, not emitted with weekly=0 via ${m7:-0}. Endpoint mock is 5h=90, so a
+# rejected mirror falls through to Trigger A. A used partial mirror (5h=13,
+# weekly=0) would HOLD: no A, and 0-vs-5 weekly spread is below the dead zone.
+scenario_mirror_missing_weekly_falls_back_to_poll() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    make_usage "$STORE/acctA.usage.json" 0 5
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 5
+    make_mock "$MOCK" "tok-acctB" 0 5
+    printf '{"five_hour_pct":13,"five_hour_reset":0,"seven_day_reset":%s}\n' \
+        "$WK_RESET_EPOCH" > "$MIRROR_FILE"
+    chmod 600 "$MIRROR_FILE"
+
+    run_rotate
+    assert_exit 0 "$RC" "mirror-missing-weekly exits 0"
+    assert_eq "acctB" "$(active_label)" "mirror missing seven_day_pct ignored => poll endpoint(5h=90) => Trigger A swaps to acctB"
+    assert_cred_token "$CRED" "tok-acctB" "mirror-missing-weekly live cred is acctB"
+}
+
+# World-writable (0666) mirror is untrusted even when numeric, fresh, owned by
+# self, and identity-matched. Same HOLD-vs-swap shape as the preferred-mirror
+# test: a used mirror (5h=13) HOLDs; ignoring it polls 5h=90 and swaps.
+scenario_mirror_world_writable_falls_back_to_poll() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    make_usage "$STORE/acctA.usage.json" 0 5
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 5
+    make_mock "$MOCK" "tok-acctB" 0 5
+    make_mirror "$MIRROR_FILE" 13 5 "$WK_RESET_EPOCH"
+    chmod 666 "$MIRROR_FILE"
+
+    run_rotate
+    assert_exit 0 "$RC" "mirror-world-writable exits 0"
+    assert_eq "acctB" "$(active_label)" "world-writable 0666 mirror ignored even when numeric and identity-matched => poll endpoint(5h=90) => Trigger A swaps to acctB"
+    assert_cred_token "$CRED" "tok-acctB" "mirror-world-writable live cred is acctB"
+}
+
 # Change 2: a NON-active account with an EXPIRED stored token gets refreshed via its
 # stored refresh token before polling. After the tick <label>.json has the NEW
 # accessToken and a future expiresAt, and the polled usage drives the decision.
@@ -1545,6 +1619,9 @@ run_scenario "Mirror preferred over endpoint, skips poll"      scenario_mirror_p
 run_scenario "Mirror reset mismatch => falls back to poll"     scenario_mirror_reset_mismatch_falls_back_to_poll
 run_scenario "Mirror stale => falls back to poll"              scenario_mirror_stale_falls_back_to_poll
 run_scenario "Mirror without anchor => falls back to poll"     scenario_mirror_no_anchor_falls_back_to_poll
+run_scenario "Non-numeric utilization is UNKNOWN, never 0"     scenario_non_numeric_utilization_is_unknown
+run_scenario "Mirror missing weekly => falls back to poll"     scenario_mirror_missing_weekly_falls_back_to_poll
+run_scenario "Mirror world-writable 0666 => falls back to poll" scenario_mirror_world_writable_falls_back_to_poll
 run_scenario "Refresh expired non-active token before polling"  scenario_refresh_expired_nonactive
 run_scenario "Refresh mock missing => UNKNOWN, store unchanged"  scenario_refresh_missing_unknown
 run_scenario "Active account is never refreshed out of band"    scenario_active_never_refreshed

@@ -53,6 +53,20 @@ fetch_usage() {
     fi
 }
 
+# maybe_usage_pct <value> - echo <value> as a number if it is in [0, 100]
+# inclusive (JSON number or numeric string). Echo nothing for empty, non-numeric
+# (n/a, true, ...), or out of range. Unknown usage must never become 0: awk and
+# jq numeric coercion turn those strings into 0, which reads as maximum headroom
+# and wins every Trigger A/B comparison. Same 0-100 rule as Codex maybe_number.
+maybe_usage_pct() {
+    local v="${1:-}"
+    [ -n "$v" ] || return 0
+    jq -nr --arg v "$v" '
+        ($v | tonumber?) as $n
+        | if $n == null or $n < 0 or $n > 100 then empty else $n end
+    ' 2>/dev/null || true
+}
+
 # read_active_mirror <active_label> - echo a fetch_usage-shaped usage response for
 # the ACTIVE account sourced from the statusline usage mirror, but ONLY when that
 # mirror is safe to trust; echo nothing otherwise (caller then polls the endpoint).
@@ -62,9 +76,10 @@ fetch_usage() {
 # rotator skip a redundant poll on the token most likely to be rate-limited, and
 # keeps the rotator informed even while oauth/usage is 429ing that token (the exact
 # blind-out that parks rotation). The mirror is trusted only when ALL hold:
-#   1. it exists and its mtime is within $ROTATOR_MIRROR_TTL (fresh);
-#   2. it carries a numeric five_hour_pct;
-#   3. its seven_day_reset matches the active account's KNOWN weekly reset (from
+#   1. it exists, is owned by this uid, and is not world-writable;
+#   2. its mtime is within $ROTATOR_MIRROR_TTL (fresh);
+#   3. both five_hour_pct and seven_day_pct are numeric in [0, 100];
+#   4. its seven_day_reset matches the active account's KNOWN weekly reset (from
 #      $STORE/<active>.usage.json, written only by real polls). The reset is a
 #      stable per-account identifier, so this proves the mirror describes the
 #      active account -- a lingering old-account session (post-swap, still on its
@@ -72,12 +87,23 @@ fetch_usage() {
 #      mislabel-driven ping-pong the mirror otherwise risks.
 # Utilization is never sourced from stored usage.json (only the reset anchor is),
 # so the deliberate no-stale-usage rule is preserved: a decision never runs on a
-# stale utilization reading.
+# stale utilization reading. A missing weekly is UNKNOWN, never defaulted to 0.
 read_active_mirror() {
     local active="$1"
     local mirror="${ROTATOR_MIRROR_FILE:-/tmp/claude-usage-starship.json}"
     local ttl="${ROTATOR_MIRROR_TTL:-900}"
     [ -f "$mirror" ] || return 0
+
+    # Sticky /tmp only blocks replacing another uid's file; a create-first race
+    # can plant a file we would otherwise read. A 0666 file owned by self is
+    # also untrusted (any local uid can write it).
+    local owner perm
+    owner=$(stat -c %u "$mirror" 2>/dev/null) || return 0
+    [ "$owner" = "$(id -u)" ] || return 0
+    perm=$(stat -c %a "$mirror" 2>/dev/null) || return 0
+    case "${perm: -1}" in
+        2|3|6|7) return 0 ;;
+    esac
 
     local now mmod age
     now=$(date +%s)
@@ -86,10 +112,11 @@ read_active_mirror() {
     [ "$age" -le "$ttl" ] || return 0
 
     local m5 m7 mreset
-    m5=$(jq -r '.five_hour_pct // empty' "$mirror" 2>/dev/null)
-    m7=$(jq -r '.seven_day_pct // empty' "$mirror" 2>/dev/null)
+    m5=$(maybe_usage_pct "$(jq -r '.five_hour_pct // empty' "$mirror" 2>/dev/null)")
+    m7=$(maybe_usage_pct "$(jq -r '.seven_day_pct // empty' "$mirror" 2>/dev/null)")
     mreset=$(jq -r '.seven_day_reset // empty' "$mirror" 2>/dev/null)
     [ -n "$m5" ] || return 0
+    [ -n "$m7" ] || return 0
     [ -n "$mreset" ] && [ "$mreset" != "null" ] || return 0
 
     # Identity anchor: the active account's last real-poll weekly reset.
@@ -109,7 +136,7 @@ read_active_mirror() {
     # only by real polls, never overwritten by mirror data).
     s5reset=$(jq -r '.five_hour.resets_at // empty' "$ustore" 2>/dev/null)
     printf '{"five_hour":{"utilization":%s,"resets_at":"%s"},"seven_day":{"utilization":%s,"resets_at":"%s"}}' \
-        "$m5" "$s5reset" "${m7:-0}" "$s7reset"
+        "$m5" "$s5reset" "$m7" "$s7reset"
 }
 
 # write_usage <label> <resp> - atomically write $STORE/<label>.usage.json from a

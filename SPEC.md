@@ -123,9 +123,11 @@ Default is the tick. `status` is a dry read-out: compute and print, never write 
    is NO stale-usage fallback, so a stale `<label>.usage.json` is never read into a
    decision (it stays only as an informational record). The ACTIVE account is never
    refreshed out of band (the live client owns its refresh-token rotation), and
-   DRY/status never refreshes. Treat a missing/unknown weekly as unknown (exclude
-   from min / divergence), and never let an unknown value fire or be targeted by a
-   trigger.
+   DRY/status never refreshes. Treat a missing, non-numeric, or out-of-range
+   utilization (not a number in 0-100 inclusive) as unknown (exclude from min /
+   divergence), and never let an unknown value fire or be targeted by a trigger.
+   Unknown is empty, never 0: zero reads as maximum headroom and wins every
+   comparison.
 6. decide:
    - Trigger A (5h pressure): ACTIVE `five_hour.utilization >= FIVE_HOUR_PCT`.
      Target = the account other than ACTIVE with the LOWEST `five_hour.utilization`.
@@ -245,6 +247,9 @@ Use a temp `ROTATOR_STORE` and temp `ROTATOR_CRED` (fixtures), a stubbed
   no trigger, and `<label>.json` is byte-unchanged.
 - Non-active failed poll with a stale `<label>.usage.json` on disk => the account is
   UNKNOWN; the stale usage is NOT read into the decision (no stale-usage fallback).
+- Non-numeric utilization (e.g. `n/a`) is UNKNOWN, never 0, and is never a Trigger A
+  target. A fresh identity-matched mirror missing `seven_day_pct`, or a world-writable
+  (0666) mirror, is ignored in favor of the endpoint poll.
 - The ACTIVE account is never refreshed out of band even with an expired live token and
   a refresh mock present.
 - DRY/status never refreshes: `status` over an expired non-active token leaves
