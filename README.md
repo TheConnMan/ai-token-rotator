@@ -310,9 +310,9 @@ parked on the capped account spending its reserve.
 
 A swap only happens if a valid target exists, it is not already the active
 account, and its stored credential file is valid. An account whose live usage
-fetch fails (idle token expired, 401) falls back to its last stored usage; an
-account with no known weekly is excluded from divergence and never fires a
-trigger.
+fetch fails (idle token expired, 401) is UNKNOWN: unknown never fires a
+trigger and is never a target. There is no stale-usage fallback;
+`<label>.usage.json` is informational only.
 
 ## Dry read-out
 
