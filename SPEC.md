@@ -84,7 +84,8 @@ Utilization scale is 0-100. Fields: `.five_hour.utilization` / `.five_hour.reset
 
 ### `bootstrap.sh <label>`
 One-time per account. Precondition: you are currently logged into that account.
-1. `mkdir -p` store (0700).
+1. Prepare the store (0700): refuse a symlink, require owner == current uid,
+   `chmod 700` and verify. Abort if the store is unsafe.
 2. valid-cred check on the live cred file, else abort with a clear message.
 3. capture TOKEN-ONLY (`{"claudeAiOauth": {...}}`) into `<label>.json` (0600).
 4. MCP handling. A `/login` MAY clear the live `.mcpOAuth`, though in practice the
@@ -105,7 +106,10 @@ One-time per account. Precondition: you are currently logged into that account.
 ### `rotate.sh [status]`
 Default is the tick. `status` is a dry read-out: compute and print, never write or swap.
 1. `status` arg => DRY mode.
-2. not DRY: `[ -f "$STORE/ENABLED" ] || exit 0`.
+2. not DRY: `[ -f "$STORE/ENABLED" ] || exit 0`. Then `prepare_store` (refuse a
+   symlink, require owner == current uid, `chmod 700` and verify). An unsafe
+   store skips the tick without writing credentials (exit 0). `status` never
+   calls this check.
 3. require the `active` pointer; read ACTIVE. Read ACCOUNTS. If only one account,
    it is a monitored no-op: still poll and log, never swap.
 4. sync-out (skip if DRY): if the live cred file is valid, capture its token
@@ -205,7 +209,11 @@ Token-only helpers (all atomic: temp in the destination dir + chmod 600 + `mv -f
   rather than write an invalid live file. MCP tokens are never moved by a swap.
 - sync-out-before-swap-in ALWAYS (preserves the rotated account-token refresh).
 - Never overwrite the store from an invalid/partial live file.
-- Store dir 0700; every written file 0600.
+- Store dir 0700; every written file 0600. Every live tick and bootstrap
+  re-asserts this: refuse a symlink store, require owner == current uid,
+  `chmod 700` and verify mode 700, `chmod 600` `rotate.log` on append. An
+  unsafe store skips the tick without writing credentials (log if possible,
+  else exit 0). Bootstrap exits 1 on an unsafe store.
 - Read-modify-write over the live cred, NOT a symlink.
 - N=1 => monitored no-op. Target must never equal ACTIVE.
 - Config thresholds honored; utilization scale 0-100.
@@ -254,6 +262,9 @@ Use a temp `ROTATOR_STORE` and temp `ROTATOR_CRED` (fixtures), a stubbed
   a refresh mock present.
 - DRY/status never refreshes: `status` over an expired non-active token leaves
   `<label>.json` byte-unchanged.
+- A world-writable (0777) store is `chmod 700` on a live tick (or the tick
+  aborts without writing credentials if chmod cannot).
+- A symlink store is refused; the live cred fixture is byte-identical.
 - Refresh-token rotation is persisted: a rotated `refresh_token` in the response updates
   `<label>.json`'s refreshToken.
 Mock ONLY the external usage + token-refresh HTTP calls (and the clock if needed). Do

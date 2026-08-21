@@ -14,17 +14,34 @@ umask 077
 CRED="${ROTATOR_CRED:-$HOME/.claude/.credentials.json}"
 STORE="${ROTATOR_STORE:-$HOME/.claude/accounts}"
 
+# prepare_store - refuse a symlink store, require owner == this uid, chmod 700
+# and verify that mode. Same shape as Codex codex_prepare_store. A leftover
+# 0755/0777 directory is not 0700: mkdir -m only applies when creating, so
+# live ticks must re-assert. Returns non-zero on an unsafe store; callers skip
+# the tick without writing credentials.
+prepare_store() {
+    local owner mode
+    [ ! -L "$STORE" ] || return 1
+    mkdir -p "$STORE" 2>/dev/null || return 1
+    [ -d "$STORE" ] && [ ! -L "$STORE" ] || return 1
+    owner=$(stat -c '%u' "$STORE" 2>/dev/null) || return 1
+    [ "$owner" = "$(id -u)" ] || return 1
+    chmod 700 "$STORE" 2>/dev/null || return 1
+    mode=$(stat -c '%a' "$STORE" 2>/dev/null) || return 1
+    [ "$mode" = "700" ]
+}
+
 # log <msg> - append an ISO-8601 stamped line to the rotate log and echo to
-# stderr. Creates the store dir only when we actually log.
+# stderr. Creates the store dir only when we actually log. An unsafe store
+# skips the file write (stderr still gets the line).
 log() {
     local msg="$*"
     local stamp
     stamp=$(date -Iseconds)
-    # SC2174: -m applies only to the deepest dir, which is exactly $STORE (the
-    # one that must be 0700); its parents (~/.claude) already exist.
-    # shellcheck disable=SC2174
-    mkdir -m 700 -p "$STORE" 2>/dev/null
-    printf '[%s] %s\n' "$stamp" "$msg" >> "$STORE/rotate.log"
+    if prepare_store; then
+        printf '[%s] %s\n' "$stamp" "$msg" >> "$STORE/rotate.log" || return 1
+        chmod 600 "$STORE/rotate.log" 2>/dev/null || return 1
+    fi
     printf '[%s] %s\n' "$stamp" "$msg" >&2
 }
 

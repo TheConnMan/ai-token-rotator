@@ -45,6 +45,15 @@ if [ "$DRY" -eq 0 ] && [ ! -f "$STORE/ENABLED" ]; then
     exit 0
 fi
 
+# Re-assert store 0700 on every live tick (not status). An unsafe store
+# (symlink, wrong owner, chmod 700 failed) skips without writing credentials.
+if [ "$DRY" -eq 0 ]; then
+    if ! prepare_store; then
+        log "unsafe store; skipping tick"
+        exit 0
+    fi
+fi
+
 # Require the active pointer.
 if [ ! -f "$STORE/active" ]; then
     if [ "$DRY" -eq 1 ]; then

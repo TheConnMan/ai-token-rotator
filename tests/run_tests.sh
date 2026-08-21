@@ -1831,6 +1831,89 @@ run_scenario "Ceiling: pin releases at the account ceiling"     scenario_ceiling
 run_scenario "Ceiling: pin holds below the account ceiling"     scenario_ceiling_pin_holds_below_account_ceiling
 run_scenario "Ceiling: default applies to an unnamed account"   scenario_ceiling_default_applies_to_unnamed_account
 
+# Live ticks must re-assert store 0700. A leftover 0777 directory is a TOCTOU
+# primitive for the predictable $STORE/*.tmp writers; chmod 700 closes it.
+# If chmod cannot, the tick must abort without writing credentials.
+scenario_world_writable_store_tightened() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 10
+    make_mock "$MOCK" "tok-acctB" 10 10
+    chmod 777 "$STORE"
+
+    run_rotate
+    assert_exit 0 "$RC" "world-writable store tick exits 0"
+    assert_eq "700" "$(stat -c '%a' "$STORE")" \
+        "world-writable store tightened to 700"
+    assert_eq "acctA" "$(active_label)" \
+        "world-writable store tick still held on acctA"
+    if [ -f "$STORE/rotate.log" ]; then
+        assert_eq "600" "$(stat -c '%a' "$STORE/rotate.log")" \
+            "world-writable store tick chmod 600 rotate.log"
+    fi
+}
+
+# A symlink store is refused. Following it would chmod/write the target, and
+# a live tick that proceeded would swap credentials through the link.
+scenario_symlinked_store_refused() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 90 10
+    make_mock "$MOCK" "tok-acctB" 20 10
+    local real_store="$SB/real-store"
+    mv "$STORE" "$real_store"
+    ln -s "$real_store" "$STORE"
+    local cred_before
+    cred_before=$(file_sha "$CRED")
+
+    run_rotate
+    assert_exit 0 "$RC" "symlinked store tick exits 0"
+    assert_eq "$cred_before" "$(file_sha "$CRED")" \
+        "symlinked store left live cred byte-identical"
+    assert_eq "acctA" "$(cat "$real_store/active")" \
+        "symlinked store left active pointer unchanged"
+}
+
+# Bootstrap uses the same prepare_store: a leftover 0777 dir is tightened.
+scenario_bootstrap_world_writable_store_tightened() {
+    make_cred "$CRED" "tok-acctA"
+    chmod 777 "$STORE"
+
+    run_bootstrap acctA
+    assert_exit 0 "$RC" "bootstrap world-writable store exits 0"
+    assert_eq "700" "$(stat -c '%a' "$STORE")" \
+        "bootstrap world-writable store tightened to 700"
+    assert_eq "acctA" "$(active_label)" "bootstrap world-writable store set active"
+}
+
+# Bootstrap refuses a symlink store and does not write the live cred.
+scenario_bootstrap_symlinked_store_refused() {
+    make_cred "$CRED" "tok-acctA"
+    local real_store="$SB/real-store"
+    mv "$STORE" "$real_store"
+    ln -s "$real_store" "$STORE"
+    local cred_before
+    cred_before=$(file_sha "$CRED")
+
+    run_bootstrap acctA
+    assert_exit 1 "$RC" "bootstrap symlinked store exits 1"
+    assert_eq "$cred_before" "$(file_sha "$CRED")" \
+        "bootstrap symlinked store left live cred byte-identical"
+}
+
+run_scenario "World-writable 0777 store is tightened to 700"   scenario_world_writable_store_tightened
+run_scenario "Symlinked store is refused, live cred unchanged" scenario_symlinked_store_refused
+run_scenario "Bootstrap tightens a world-writable store to 700" scenario_bootstrap_world_writable_store_tightened
+run_scenario "Bootstrap refuses a symlinked store"             scenario_bootstrap_symlinked_store_refused
+
 printf '\n----------------------------------------\n'
 printf 'Summary: %d passed, %d failed\n' "$PASS" "$FAILED"
 CLAUDE_RC=0

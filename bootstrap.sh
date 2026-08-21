@@ -22,8 +22,10 @@ case "$label" in
         ;;
 esac
 
-mkdir -p "$STORE"
-chmod 700 "$STORE"
+if ! prepare_store; then
+    echo "error: failed to prepare account store" >&2
+    exit 1
+fi
 
 if ! valid_cred "$CRED"; then
     echo "error: $CRED is missing or has no access token." >&2

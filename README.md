@@ -401,8 +401,11 @@ practice:
 - **The store holds live credentials.** `<label>.json`, `mcp.json`, and the Codex
   `<label>.tokens` files contain usable access and refresh tokens. The store is
   created outside the repository (default `~/.claude/accounts` and `~/.codex/accounts`)
-  with directory mode 0700 and file mode 0600, enforced by explicit `chmod`s on every
-  write plus a `umask 077`, so nothing it writes is readable by another user.
+  with directory mode 0700 and file mode 0600. Every live Claude tick and bootstrap
+  re-asserts the store: refuse a symlink, require owner == the current uid,
+  `chmod 700` and verify that mode, and `chmod 600` `rotate.log` on append.
+  Writes also use explicit `chmod`s plus a `umask 077`. An unsafe store skips
+  the tick without writing credentials.
 - **Never move the store inside the repository.** Point `ROTATOR_STORE` at a path a
   git working tree does not cover. `.gitignore` blocks the obvious names as a
   backstop, not as the primary control.
