@@ -22,7 +22,12 @@ CODEX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CODEX_ROTATOR_STORE:=$HOME/.codex/accounts}"
 : "${CODEX_APPSERVER_RESTART:=1}"
 : "${CODEX_APPSERVER_SOCKET:=${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock}"
-: "${CODEX_INFLIGHT_CMD:=}"
+# Unset uses the bundled probe. Empty is the operator/test escape that
+# disables the gate. Use +x, not :=, because := treats empty as unset and
+# would launch the real probe from the test suite.
+if [ -z "${CODEX_INFLIGHT_CMD+x}" ]; then
+    CODEX_INFLIGHT_CMD="$CODEX_LIB_DIR/codex-inflight.sh"
+fi
 
 # Only weekly_ceil, weekly_dead_zone, and the numeric helpers are reused from
 # the Claude library. Codex credentials use the functions below exclusively.
@@ -322,6 +327,8 @@ codex_kill_appserver() {
 # way an unknown usage reading never fires a trigger.
 codex_work_in_flight() {
     local out rc
+    # Empty (set, but blank) is the explicit disable. Unset is filled in
+    # above with the bundled probe, so it never reaches this check.
     [ -n "$CODEX_INFLIGHT_CMD" ] || return 1
     # Deliberately unquoted so the configured value may carry arguments.
     # shellcheck disable=SC2086

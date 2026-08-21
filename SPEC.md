@@ -347,9 +347,10 @@ provider credentials. See `README.md` for operator setup.
   located by the pid listening on `CODEX_APPSERVER_SOCKET`.
 10. Killing the app-server interrupts every running turn, so no swap fires while
   Codex work is in flight. `CODEX_INFLIGHT_CMD` is the probe: non-empty stdout means
-  work is in flight. An unset probe disables the gate. A probe that exits non-zero is
-  UNKNOWN and counts as in flight, because an unanswerable probe is never a licence
-  to kill a job. The gate covers PIN forced swaps too.
+  work is in flight. Unset uses the bundled `codex-inflight.sh`. An empty value
+  disables the gate. A probe that exits non-zero is UNKNOWN and counts as in
+  flight, because an unanswerable probe is never a licence to kill a job. The
+  gate covers PIN forced swaps too.
 10a. `codex-inflight.sh` is that probe. It asks the app-server itself, via
   `thread/list`, which threads are running. The app-server is the only component that
   sees every turn, so one probe covers Codex Desktop, the CLI, and any external

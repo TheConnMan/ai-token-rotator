@@ -182,7 +182,7 @@ setup_sandbox() {
     APPSERVER="$SB/appserver"
     mkdir -p "$STORE" "$(dirname "$AUTH")" "$MOCK" "$REFRESH" "$APPSERVER"
     chmod 700 "$STORE"
-    unset CODEX_INFLIGHT_CMD CODEX_APPSERVER_RESTART
+    unset CODEX_INFLIGHT_CMD CODEX_APPSERVER_RESTART CODEX_APPSERVER_SOCKET
 }
 
 # The app-server is a process boundary, mocked the same way the WHAM endpoint and
@@ -223,6 +223,92 @@ run_rotate() {
             bash "$ROTATE" "$@" 2>&1
     )
     RC=$?
+}
+
+# Same as run_rotate, but leaves CODEX_INFLIGHT_CMD unset so the lib default
+# applies. Callers must point CODEX_APPSERVER_SOCKET at a sandbox path; this
+# must never talk to the real ~/.codex app-server.
+run_rotate_default_inflight() {
+    [ -n "${CODEX_APPSERVER_SOCKET:-}" ] || {
+        fail "run_rotate_default_inflight requires a sandbox CODEX_APPSERVER_SOCKET"
+        return
+    }
+    guard_tmp "$CODEX_APPSERVER_SOCKET"
+    OUT=$(
+        CODEX_ROTATOR_AUTH="$AUTH" \
+        CODEX_ROTATOR_STORE="$STORE" \
+        ROTATOR_CONFIG="$CONFIG" \
+        CODEX_USAGE_MOCK_DIR="$MOCK" \
+        CODEX_REFRESH_MOCK_DIR="$REFRESH" \
+        CODEX_APPSERVER_MOCK_DIR="$APPSERVER" \
+        CODEX_APPSERVER_SOCKET="$CODEX_APPSERVER_SOCKET" \
+        CODEX_APPSERVER_RESTART="${CODEX_APPSERVER_RESTART:-1}" \
+        env -u CODEX_INFLIGHT_CMD \
+            bash "$ROTATE" "$@" 2>&1
+    )
+    RC=$?
+}
+
+# Copy the libs into the sandbox so a sourced default resolves to a sibling
+# stub rather than the real host probe.
+install_sandbox_codex_lib() {
+    mkdir -p "$SB/libcopy" "$SB/home" "$SB/claude.store"
+    cp "$CODEX_LIB" "$SB/libcopy/codex-lib.sh"
+    cp "$REPO_ROOT/lib.sh" "$SB/libcopy/lib.sh"
+    cat > "$SB/libcopy/codex-inflight.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'sandbox-sibling-probe\n'
+exit 0
+EOF
+    chmod 700 "$SB/libcopy/codex-inflight.sh"
+}
+
+# $1 is "unset" (default) or "empty". Prints the resolved CODEX_INFLIGHT_CMD.
+source_sandbox_codex_lib() {
+    local mode="${1:-unset}"
+    if [ "$mode" = "empty" ]; then
+        HOME="$SB/home" \
+        ROTATOR_CONFIG="$CONFIG" \
+        ROTATOR_CRED="$SB/claude.credentials.json" \
+        ROTATOR_STORE="$SB/claude.store" \
+        CODEX_ROTATOR_AUTH="$AUTH" \
+        CODEX_ROTATOR_STORE="$STORE" \
+        CODEX_INFLIGHT_CMD="" \
+            bash -c 'source "$1" && printf %s "$CODEX_INFLIGHT_CMD"' bash "$SB/libcopy/codex-lib.sh"
+    else
+        HOME="$SB/home" \
+        ROTATOR_CONFIG="$CONFIG" \
+        ROTATOR_CRED="$SB/claude.credentials.json" \
+        ROTATOR_STORE="$SB/claude.store" \
+        CODEX_ROTATOR_AUTH="$AUTH" \
+        CODEX_ROTATOR_STORE="$STORE" \
+        env -u CODEX_INFLIGHT_CMD \
+            bash -c 'source "$1" && printf %s "$CODEX_INFLIGHT_CMD"' bash "$SB/libcopy/codex-lib.sh"
+    fi
+}
+
+# $1 is "unset" (default) or "empty". Exit status is codex_work_in_flight's.
+sandbox_codex_work_in_flight() {
+    local mode="${1:-unset}"
+    if [ "$mode" = "empty" ]; then
+        HOME="$SB/home" \
+        ROTATOR_CONFIG="$CONFIG" \
+        ROTATOR_CRED="$SB/claude.credentials.json" \
+        ROTATOR_STORE="$SB/claude.store" \
+        CODEX_ROTATOR_AUTH="$AUTH" \
+        CODEX_ROTATOR_STORE="$STORE" \
+        CODEX_INFLIGHT_CMD="" \
+            bash -c 'source "$1"; codex_work_in_flight' bash "$SB/libcopy/codex-lib.sh"
+    else
+        HOME="$SB/home" \
+        ROTATOR_CONFIG="$CONFIG" \
+        ROTATOR_CRED="$SB/claude.credentials.json" \
+        ROTATOR_STORE="$SB/claude.store" \
+        CODEX_ROTATOR_AUTH="$AUTH" \
+        CODEX_ROTATOR_STORE="$STORE" \
+        env -u CODEX_INFLIGHT_CMD \
+            bash -c 'source "$1"; codex_work_in_flight' bash "$SB/libcopy/codex-lib.sh"
+    fi
 }
 
 run_bootstrap() {
@@ -1047,6 +1133,8 @@ EOF
         assert_contains "$(cat "$service")" "Description=Codex token rotator tick" "Codex service description"
         assert_contains "$(cat "$service")" "Type=oneshot" "Codex service type"
         assert_contains "$(cat "$service")" "ExecStart=$REPO_ROOT/codex-rotate.sh" "Codex service command"
+        assert_contains "$(cat "$service")" "Environment=CODEX_INFLIGHT_CMD=$REPO_ROOT/codex-inflight.sh" \
+            "Codex service in-flight probe"
     fi
     if [ ! -f "$timer" ]; then
         fail "install did not create the Codex timer"
@@ -1397,6 +1485,57 @@ scenario_quiet_inflight_probe_allows_swap() {
     assert_eq "4242" "$(killed_pids)" "quiet in-flight probe allowed the restart"
 }
 
+scenario_unset_inflight_cmd_defaults_to_sibling_probe() {
+    make_config "acctA"
+    install_sandbox_codex_lib
+    local resolved rc expected
+    expected="$(cd "$SB/libcopy" && pwd)/codex-inflight.sh"
+    resolved=$(source_sandbox_codex_lib unset)
+    assert_eq "$expected" "$resolved" \
+        "unset CODEX_INFLIGHT_CMD resolves to the sibling bundled probe"
+    sandbox_codex_work_in_flight unset
+    rc=$?
+    assert_exit 0 "$rc" "unset CODEX_INFLIGHT_CMD invokes the sibling probe (in flight)"
+}
+
+scenario_empty_inflight_cmd_disables_the_gate() {
+    make_config "acctA"
+    install_sandbox_codex_lib
+    local resolved rc
+    resolved=$(source_sandbox_codex_lib empty)
+    assert_eq "" "$resolved" "empty CODEX_INFLIGHT_CMD stays empty"
+    sandbox_codex_work_in_flight empty
+    rc=$?
+    assert_exit 1 "$rc" "empty CODEX_INFLIGHT_CMD disables the gate"
+}
+
+# Unset (not empty) must use the bundled probe through the real rotator. The
+# fake app-server lives on a sandbox socket so this never talks to ~/.codex.
+scenario_unset_inflight_cmd_holds_via_bundled_probe() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    start_fake_appserver active
+    CODEX_APPSERVER_SOCKET="$FAKE_SOCK"
+    set_appserver_pid 4242
+
+    run_rotate_default_inflight
+
+    stop_fake_appserver
+
+    assert_exit 0 "$RC" "unset inflight default exit"
+    assert_active acctA "unset default probe held the swap while work was in flight"
+    assert_eq "accessA" "$(jq -r '.tokens.access_token // empty' "$AUTH" 2>/dev/null)" \
+        "unset default probe left the live auth untouched"
+    assert_eq "" "$(killed_pids)" "unset default probe must not kill the app-server"
+    assert_contains "$OUT" "in flight" "unset default probe hold explained itself"
+}
+
 scenario_inflight_work_blocks_pinned_swap() {
     make_config "acctA acctB"
     seed_account acctA "accessA" "accountA"
@@ -1546,6 +1685,9 @@ run_scenario "In-flight work blocks the swap"                    scenario_inflig
 run_scenario "Unknown in-flight state blocks the swap"           scenario_inflight_probe_failure_holds
 run_scenario "Quiet in-flight probe allows the swap"             scenario_quiet_inflight_probe_allows_swap
 run_scenario "In-flight work blocks a pinned swap"               scenario_inflight_work_blocks_pinned_swap
+run_scenario "Unset CODEX_INFLIGHT_CMD defaults to bundled probe" scenario_unset_inflight_cmd_defaults_to_sibling_probe
+run_scenario "Empty CODEX_INFLIGHT_CMD disables the gate"         scenario_empty_inflight_cmd_disables_the_gate
+run_scenario "Unset CODEX_INFLIGHT_CMD holds via bundled probe"   scenario_unset_inflight_cmd_holds_via_bundled_probe
 
 run_scenario "Probe reports an active thread"                     scenario_inflight_probe_reports_active_thread
 run_scenario "Probe is quiet when nothing runs"                  scenario_inflight_probe_is_quiet_when_nothing_runs

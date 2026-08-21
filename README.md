@@ -114,6 +114,11 @@ touch ~/.codex/accounts/ENABLED
 `./install.sh` installs and starts both the Claude and Codex systemd user timers.
 Each service remains inactive until its own `ENABLED` file exists.
 
+A Codex swap restarts the app-server, so the rotator will not swap while a turn is
+running. Unset `CODEX_INFLIGHT_CMD` uses the bundled `codex-inflight.sh`; set it to
+empty to disable that gate. `./install.sh` also pins the Codex service unit to the
+bundled probe.
+
 ## Codex usage, PIN, and ceilings
 
 Each tick polls every stored Codex account directly through the authenticated WHAM

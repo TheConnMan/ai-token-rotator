@@ -49,6 +49,7 @@ Description=Codex token rotator tick
 [Service]
 Type=oneshot
 ExecStart=$HERE/codex-rotate.sh
+Environment=CODEX_INFLIGHT_CMD=$HERE/codex-inflight.sh
 EOF
 
 cat > "$UNIT_DIR/cc-codex-token-rotator.timer" <<EOF
