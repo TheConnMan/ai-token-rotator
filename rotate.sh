@@ -85,11 +85,11 @@ fi
 # PIN sentinel: an operator (bonus drain) can force the rotator onto a specific
 # account by writing its label to $STORE/PIN. While present we force
 # active=<label> by swapping in its stored token and SUSPEND Trigger A/B,
-# emitting decision=PINNED. A stale PIN pins forever by design; the writer owns
-# cleanup. PINNED is distinct from the HOLD decision, which means a trigger did
-# not fire this tick. PINNED means swap decisions are operator driven. Exception:
-# a weekly-exhaustion escape valve releases the pin for a tick when the pinned
-# account's weekly is spent (see PIN_ACTIVE below).
+# emitting decision=PINNED. The writer normally owns cleanup, except that a known
+# fully exhausted weekly subscription clears its own stale PIN. PINNED is distinct
+# from the HOLD decision, which means a trigger did not fire this tick. PINNED means
+# swap decisions are operator driven. A weekly-ceiling escape valve also releases the
+# pin for a tick when the pinned account reaches its reserve (see PIN_ACTIVE below).
 PINNED=0
 PIN_LABEL=""
 if [ -f "$STORE/PIN" ]; then
@@ -220,6 +220,7 @@ target=""
 reason=""
 effZone=""
 pin_released=0
+pin_clear_on_live=0
 
 # Every account's own ceiling, resolved once. Config only, so this needs no usage reading.
 declare -A CEIL
@@ -239,8 +240,9 @@ capped() {
 
 # Weekly-exhaustion escape valve: while pinned, if the pinned account's weekly is KNOWN and
 # at or above ITS OWN ceiling, degrade this tick to normal rotation by running the triggers
-# as if unpinned. We override the pin via an EFFECTIVE flag (PIN_ACTIVE) and do NOT delete
-# $STORE/PIN: the writer owns cleanup, and if weekly later resets the pin naturally resumes.
+# as if unpinned. The PIN remains at this reserve threshold so it can resume after a weekly
+# reset. At a known 100% weekly utilization, however, the subscription is entirely exhausted:
+# clear the stale PIN on a live tick so an external bonus-drain controller cannot resume it.
 # Unknown or below-ceiling weekly leaves the pin fully in force.
 #
 # This reads the per-account ceiling rather than one global number for a specific reason: a
@@ -253,6 +255,7 @@ if [ "$PINNED" -eq 1 ] && [ -n "$PIN_LABEL" ] && [ -n "${WEEK[$PIN_LABEL]:-}" ] 
     && [ -n "${CEIL[$PIN_LABEL]:-}" ] && num_ge "${WEEK[$PIN_LABEL]}" "${CEIL[$PIN_LABEL]}"; then
     PIN_ACTIVE=0
     pin_released=1
+    num_ge "${WEEK[$PIN_LABEL]}" 100 && pin_clear_on_live=1
 fi
 
 if [ "$PIN_ACTIVE" -eq 0 ]; then
@@ -420,6 +423,7 @@ fi
 # Released pin: surface it in the log so the override is visible, and never as PINNED.
 if [ "$pin_released" -eq 1 ]; then
     reason="pin-released ($PIN_LABEL weekly=${WEEK[$PIN_LABEL]} >= ceiling ${CEIL[$PIN_LABEL]}); $reason"
+    [ "$pin_clear_on_live" -eq 1 ] && reason="pin-clear-pending (weekly fully exhausted); $reason"
 fi
 
 # One decision line with every account's (5h, weekly, ceiling). The ceiling is printed
@@ -441,6 +445,14 @@ if [ "$DRY" -eq 1 ]; then
 fi
 
 log "$line"
+
+if [ "$pin_clear_on_live" -eq 1 ]; then
+    if rm -f -- "$STORE/PIN"; then
+        log "PIN cleared for $PIN_LABEL: weekly usage is fully exhausted (${WEEK[$PIN_LABEL]}%)"
+    else
+        log "PIN clear FAILED for $PIN_LABEL: weekly usage is fully exhausted (${WEEK[$PIN_LABEL]}%)"
+    fi
+fi
 
 if [ "$SHOULD_SWAP" -eq 1 ]; then
     # Token-only swap: replace only the live .claudeAiOauth from the target's

@@ -857,6 +857,28 @@ scenario_pin_releases_at_label_ceiling() {
     fi
 }
 
+scenario_pin_fully_exhausted_clears_sentinel() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    set_pin acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 100 100
+    make_usage_mock "accessB" "accountB" 10 10
+
+    run_rotate status
+    assert_exit 0 "$RC" "fully exhausted pin status exit"
+    [ -f "$STORE/PIN" ] || fail "fully exhausted pin status mutated PIN"
+    assert_contains "$OUT" "pin-clear-pending" "fully exhausted pin status reports pending cleanup"
+
+    run_rotate
+    assert_exit 0 "$RC" "fully exhausted pin live exit"
+    assert_active acctB "fully exhausted pin selected available target"
+    [ ! -e "$STORE/PIN" ] || fail "fully exhausted pin left stale PIN in place"
+}
+
 scenario_expired_weekly_reset_becomes_zero() {
     make_config "acctA acctB"
     seed_account acctA "accessA" "accountA"
@@ -1662,6 +1684,7 @@ run_scenario "Weekly divergence selects lowest weekly account"    scenario_weekl
 run_scenario "Trigger A wins when all triggers fire"              scenario_trigger_a_wins_when_all_triggers_fire
 run_scenario "Trigger C wins over weekly divergence"              scenario_trigger_c_wins_over_weekly_divergence
 run_scenario "PIN releases at its account ceiling"               scenario_pin_releases_at_label_ceiling
+run_scenario "PIN fully exhausted clears stale sentinel"          scenario_pin_fully_exhausted_clears_sentinel
 run_scenario "Expired weekly reset becomes zero"                 scenario_expired_weekly_reset_becomes_zero
 run_scenario "Windowless no credits stays exhausted"             scenario_windowless_no_credits_stays_exhausted
 run_scenario "Real window beats false credits"                   scenario_real_window_beats_false_credits

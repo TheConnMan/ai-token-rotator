@@ -1489,6 +1489,34 @@ scenario_pin_weekly_exhausted_releases_to_rotation() {
     [ -f "$STORE/PIN" ] || fail "pin-weekly-exhausted deleted PIN file (must override without deleting)"
 }
 
+# The reserve release at 98 keeps the PIN for the next weekly window, but a known 100%
+# weekly reading means the subscription is entirely exhausted. A live tick must clear the
+# stale sentinel so a bonus-drain pin cannot resume after the reset; status remains read-only.
+scenario_pin_fully_exhausted_clears_sentinel() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 100 100
+    make_mock "$MOCK" "tok-acctB" 10 10
+    set_pin acctA
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "pin-fully-exhausted status exits 0"
+    [ -f "$STORE/PIN" ] || fail "pin-fully-exhausted status mutated the PIN"
+    case "$OUT" in
+        *pin-clear-pending*) ;;
+        *) fail "pin-fully-exhausted status did not report pending PIN cleanup: $OUT" ;;
+    esac
+
+    run_rotate
+    assert_exit 0 "$RC" "pin-fully-exhausted live exits 0"
+    assert_eq "acctB" "$(active_label)" "pin-fully-exhausted swapped to available account"
+    [ ! -e "$STORE/PIN" ] || fail "pin-fully-exhausted left the stale PIN in place"
+}
+
 # Inclusive-threshold boundary: weekly=97 is BELOW the default release (98), so the
 # pin stays in force exactly as today even though acctB (weekly=10) would otherwise
 # be a valid divergence target. decision=PINNED, no swap.
@@ -1643,6 +1671,7 @@ run_scenario "PIN absent keeps swap behavior"                   scenario_pin_abs
 run_scenario "PIN invalid target holds and reports PINNED"      scenario_pin_invalid_target_holds_but_pinned
 run_scenario "PIN unconfigured label holds (not in ACCOUNTS)"   scenario_pin_unconfigured_label_holds
 run_scenario "PIN weekly-exhausted releases to rotation"        scenario_pin_weekly_exhausted_releases_to_rotation
+run_scenario "PIN fully exhausted clears stale sentinel"         scenario_pin_fully_exhausted_clears_sentinel
 run_scenario "PIN weekly below release stays pinned"            scenario_pin_weekly_below_release_stays_pinned
 run_scenario "PIN weekly-exhausted no target => HOLD not PINNED" scenario_pin_weekly_exhausted_no_target_holds_not_pinned
 run_scenario "PIN weekly unknown stays pinned"                  scenario_pin_weekly_unknown_stays_pinned

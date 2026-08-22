@@ -143,6 +143,7 @@ target=""
 reason=""
 effZone=""
 pin_released=0
+pin_clear_on_live=0
 
 declare -A CEIL
 for label in "${ACCT_ARR[@]}"; do
@@ -161,6 +162,7 @@ if [ "$PINNED" -eq 1 ] && [ -n "$PIN_LABEL" ] && [ -n "${WEEK[$PIN_LABEL]:-}" ] 
     && num_ge "${WEEK[$PIN_LABEL]}" "${CEIL[$PIN_LABEL]}"; then
     PIN_ACTIVE=0
     pin_released=1
+    num_ge "${WEEK[$PIN_LABEL]}" 100 && pin_clear_on_live=1
 fi
 
 if [ "$PIN_ACTIVE" -eq 0 ]; then
@@ -316,6 +318,7 @@ fi
 
 if [ "$pin_released" -eq 1 ]; then
     reason="pin released for $PIN_LABEL at ceiling ${CEIL[$PIN_LABEL]}; $reason"
+    [ "$pin_clear_on_live" -eq 1 ] && reason="pin-clear-pending (weekly fully exhausted); $reason"
 fi
 
 usages=""
@@ -333,6 +336,13 @@ if [ "$DRY" -eq 1 ]; then
 fi
 
 codex_log "$line"
+if [ "$pin_clear_on_live" -eq 1 ]; then
+    if rm -f -- "$CODEX_ROTATOR_STORE/PIN"; then
+        codex_log "PIN cleared for $PIN_LABEL: weekly usage is fully exhausted (${WEEK[$PIN_LABEL]}%)"
+    else
+        codex_log "PIN clear FAILED for $PIN_LABEL: weekly usage is fully exhausted (${WEEK[$PIN_LABEL]}%)"
+    fi
+fi
 if [ "$SHOULD_SWAP" -eq 1 ]; then
     if ! codex_capture_tokens "$CODEX_ROTATOR_AUTH" "$active_store" "$expected_active_account"; then
         codex_log "live Codex auth changed during poll, skipping swap"

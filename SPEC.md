@@ -333,9 +333,10 @@ provider credentials. See `README.md` for operator setup.
 6. A configured `PIN` with valid stored tokens forces that label active, suspends
   normal triggers, and reports `PINNED`. PIN force selection may choose the configured
   label even when its usage is unknown. An empty or unconfigured PIN holds the active
-  label. A PIN is released for the current decision only when its known weekly usage
-  reaches that label's weekly ceiling, while the PIN file remains for the next weekly
-  window.
+  label. A PIN is released for the current decision when its known weekly usage
+  reaches that label's weekly ceiling. The PIN file remains for the next weekly window
+  at that reserve threshold, but is cleared on a live tick when known weekly usage
+  reaches 100%.
 7. With one configured Codex account, the tick still polls and logs but never swaps.
 8. Codex status is read only. It never refreshes, writes usage or logs,
   swaps auth, updates the pointer, or otherwise mutates provider state.

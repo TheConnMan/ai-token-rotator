@@ -132,7 +132,8 @@ means the account is exhausted.
 
 Writing a configured label to the Codex store `PIN` holds that label selected while it
 is usable. A PIN for an account at its weekly ceiling is released for the current
-decision, while the PIN file remains for the next weekly window.
+decision, while the PIN file remains for the next weekly window; a known 100% weekly
+reading clears the file on a live tick.
 
 Codex uses the existing shared `WEEKLY_CEIL_<label>` resolver for both its PIN and
 Trigger C ceiling decisions. The same label therefore has the same configured ceiling
@@ -274,11 +275,14 @@ rm "$ROTATOR_STORE/PIN"             # release
 While the file exists the tick reports `decision=PINNED`, which is distinct from
 `HOLD` (no trigger fired). Details worth knowing:
 
-- **The writer owns cleanup.** `rotate.sh` never deletes `PIN`, so a pin left behind
-  pins forever. Whatever writes the file is responsible for removing it.
+- **The writer owns ordinary cleanup.** `rotate.sh` retains `PIN` at the configured
+  reserve ceiling, but clears it on a live tick once known weekly usage reaches 100%.
+  This prevents a fully exhausted bonus-drain subscription from being repinned after
+  its weekly window resets.
 - **A pin on a capped account is released for that tick.** If the pinned account is at
   or above its own `WEEKLY_CEIL_<label>`, the tick degrades to normal rotation. The
-  `PIN` file is left in place, so the pin resumes once that account's weekly resets.
+  `PIN` file is left in place, so the pin resumes once that account's weekly resets;
+  at 100% weekly utilization the file is instead cleared.
 - **An unconfigured or empty pin holds on the current account** and still reports
   `PINNED`, rather than stranding the pointer on an account the rotator never polls.
 - Codex has its own independent `PIN` in `$CODEX_ROTATOR_STORE`.

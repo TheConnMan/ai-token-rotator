@@ -106,9 +106,9 @@ from `HOLD`, which only means no trigger fired this tick.
 * An unconfigured or empty PIN holds on `active` and still reports `PINNED`. Pinning a
   label this rotator does not manage would strand `active` on an account later ticks
   never poll.
-* **The writer owns PIN cleanup.** A stale PIN pins forever by design. `rotate.sh` never
-  deletes the file, including when the pinned account reaches its own
-  `WEEKLY_CEIL_<label>` and the tick degrades to normal rotation.
+* **The writer owns ordinary PIN cleanup.** `rotate.sh` retains the file when the
+  pinned account reaches its own `WEEKLY_CEIL_<label>` and the tick degrades to normal
+  rotation, but clears it on a live tick when known weekly usage reaches 100%.
 * The writer is whatever external controller you point at the store. A batch runner that
   wants its work kept on one account pins that label before each batch and clears the pin
   between batches. Nothing in this repo ever writes `PIN`.
