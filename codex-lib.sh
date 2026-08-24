@@ -291,10 +291,17 @@ codex_write_usage() {
 
 # The app-server reads auth.json once, at startup, and caches the account for its
 # whole lifetime. A token swap therefore reaches no Codex work at all until the
-# process is replaced. On this box the app-server is spawned unmanaged by Codex
-# Desktop over SSH, so `codex app-server daemon restart` cannot manage it; killing
-# the process and letting Desktop respawn it on its next connect is the only lever.
-# It ignores SIGTERM, hence SIGKILL.
+# process is replaced.
+#
+# How to replace it depends on who owns it, and getting that wrong strands the box
+# with no app-server at all. When a systemd user unit owns the process, that unit
+# is the only thing that will bring it back, and a bare signal is not enough: the
+# unit that ships the daemon is `Type=oneshot` with `RemainAfterExit=yes`, so its
+# main pid has already exited successfully and systemd keeps reporting `active`
+# over a corpse. Nothing respawns it, and every later dispatch fails. Restart the
+# unit in that case. Only fall back to the signal when no unit owns the process,
+# which is the older arrangement where Codex Desktop respawns it on its next SSH
+# connect. It ignores SIGTERM, hence SIGKILL.
 codex_appserver_pid() {
     if [ -n "${CODEX_APPSERVER_MOCK_DIR:-}" ]; then
         [ -s "$CODEX_APPSERVER_MOCK_DIR/pid" ] || return 0
@@ -309,13 +316,71 @@ codex_appserver_pid() {
         }'
 }
 
-# 0 killed, 2 nothing was running, 1 the kill failed.
+# The systemd user unit that owns the app-server, empty when none does.
+# An explicit CODEX_APPSERVER_UNIT wins; set it empty to force the signal path.
+codex_appserver_unit() {
+    local pid=$1 unit
+    if [ -n "${CODEX_APPSERVER_UNIT+x}" ]; then
+        printf '%s' "$CODEX_APPSERVER_UNIT"
+        return 0
+    fi
+    # Never read the real cgroup tree from the test sandbox. A mock pid is an
+    # arbitrary number that may belong to a live unrelated unit on this box, and
+    # resolving it would point a restart at something the test never named.
+    [ -z "${CODEX_APPSERVER_MOCK_DIR:-}" ] || return 0
+    [ -r "/proc/$pid/cgroup" ] || return 0
+    unit=$(codex_unit_from_cgroup "$(cat "/proc/$pid/cgroup" 2>/dev/null)") || return 0
+    printf '%s' "$unit"
+}
+
+# The restartable unit named by a cgroup listing, empty when there is none.
+# Kept separate from the /proc read so the parse is exercised directly.
+codex_unit_from_cgroup() {
+    local unit
+    # The owning unit is the last path component of the cgroup line. A process
+    # parked directly in a scope has no service to restart.
+    unit=$(printf '%s\n' "$1" \
+        | sed -n 's#^.*/\([A-Za-z0-9@:_.-]*\.service\)$#\1#p' \
+        | head -1)
+    # user@N.service is the per-user session manager, not the app-server's own
+    # unit. Restarting it would tear down every user service on the box, this
+    # rotator's own timer included, to swap one token.
+    case "$unit" in
+        ""|user@*.service) return 0 ;;
+    esac
+    printf '%s' "$unit"
+}
+
+# Record for the tests, which cannot observe a signal or a systemctl call.
+codex_appserver_record() {
+    [ -n "${CODEX_APPSERVER_MOCK_DIR:-}" ] || return 0
+    printf '%s\n' "$1" >> "$CODEX_APPSERVER_MOCK_DIR/killed" || return 1
+    printf '%s %s\n' "$1" "$2" >> "$CODEX_APPSERVER_MOCK_DIR/replaced" || return 1
+}
+
+# 0 replaced, 2 nothing was running, 1 the replacement failed.
+# Sets CODEX_APPSERVER_METHOD to the lever used, so the caller can log honestly
+# about whether the daemon is already back or is waiting on an external respawn.
 codex_kill_appserver() {
-    local pid
+    local pid unit
+    CODEX_APPSERVER_METHOD=""
     pid=$(codex_appserver_pid) || return 1
     [ -n "$pid" ] || return 2
+
+    unit=$(codex_appserver_unit "$pid")
+    if [ -n "$unit" ]; then
+        if "${CODEX_SYSTEMCTL:-systemctl}" --user restart "$unit" >/dev/null 2>&1; then
+            CODEX_APPSERVER_METHOD="unit:$unit"
+            codex_appserver_record "$pid" "$CODEX_APPSERVER_METHOD" || return 1
+            return 0
+        fi
+        # A unit that refuses to restart still leaves the daemon serving the
+        # stale account, so fall through to the signal rather than give up.
+    fi
+
+    CODEX_APPSERVER_METHOD="signal"
     if [ -n "${CODEX_APPSERVER_MOCK_DIR:-}" ]; then
-        printf '%s\n' "$pid" >> "$CODEX_APPSERVER_MOCK_DIR/killed" || return 1
+        codex_appserver_record "$pid" "$CODEX_APPSERVER_METHOD" || return 1
         return 0
     fi
     kill -9 "$pid" 2>/dev/null || return 1

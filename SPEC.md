@@ -340,11 +340,23 @@ provider credentials. See `README.md` for operator setup.
 8. Codex status is read only. It never refreshes, writes usage or logs,
   swaps auth, updates the pointer, or otherwise mutates provider state.
 9. A swap alone reaches no Codex work. The app-server reads `auth.json` once at
-  startup and caches that account for its whole lifetime, so the rotator kills the
-  app-server after a swap that fully succeeded. It respawns on the next Codex
-  Desktop connect and reads the new account then. `CODEX_APPSERVER_RESTART=0`
-  disables the kill. The process ignores SIGTERM, so the kill is SIGKILL, and it is
-  located by the pid listening on `CODEX_APPSERVER_SOCKET`.
+  startup and caches that account for its whole lifetime, so the rotator replaces the
+  app-server after a swap that fully succeeded. It is located by the pid listening on
+  `CODEX_APPSERVER_SOCKET`, and `CODEX_APPSERVER_RESTART=0` disables the replacement.
+
+9a. Which lever replaces it depends on who owns the process, because the wrong lever
+  leaves the box with no app-server at all. The owning systemd user unit is read from
+  the pid's `/proc/<pid>/cgroup`, overridable with `CODEX_APPSERVER_UNIT`; an empty
+  `CODEX_APPSERVER_UNIT` forces the signal.
+  - A unit owns it: `systemctl --user restart <unit>`. A signal alone would not bring
+    it back, because the unit that ships the daemon is `Type=oneshot` with
+    `RemainAfterExit=yes` and stays `active` over a dead process.
+  - Nothing owns it: SIGKILL, and it respawns on the next Codex Desktop connect and
+    reads the new account then. The process ignores SIGTERM, so the kill is SIGKILL.
+  - A unit that fails to restart falls back to the signal, because a unit that will
+    not restart still leaves the daemon serving the account the swap moved away from.
+  - `user@N.service` is never a restart target. It is the per-user session manager,
+    and restarting it would tear down every user service on the box.
 10. Killing the app-server interrupts every running turn, so no swap fires while
   Codex work is in flight. `CODEX_INFLIGHT_CMD` is the probe: non-empty stdout means
   work is in flight. Unset uses the bundled `codex-inflight.sh`. An empty value

@@ -384,6 +384,13 @@ Common cases:
   at startup, so `CODEX_APPSERVER_RESTART=1` is what makes a swap take effect. The
   restart is deliberately blocked while `CODEX_INFLIGHT_CMD` reports work in flight,
   so a busy box can hold on the same account for several ticks.
+- **No Codex job can start at all after a swap.** The rotator restarts the app-server's
+  systemd user unit when one owns the process, and only signals the process when none
+  does. If the daemon is run from a unit the rotator cannot see or restart, a swap can
+  kill it with nothing left to bring it back. Check with
+  `systemctl --user status codex-remote-control.service`, and note that a `Type=oneshot`
+  unit reports `active (exited)` even when its daemon is gone; confirm against
+  `pgrep -af "app-server --remote-control"`. Restarting that unit is the recovery.
 
 ## Uninstall
 

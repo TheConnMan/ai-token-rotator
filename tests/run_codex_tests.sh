@@ -183,6 +183,7 @@ setup_sandbox() {
     mkdir -p "$STORE" "$(dirname "$AUTH")" "$MOCK" "$REFRESH" "$APPSERVER"
     chmod 700 "$STORE"
     unset CODEX_INFLIGHT_CMD CODEX_APPSERVER_RESTART CODEX_APPSERVER_SOCKET
+    unset CODEX_APPSERVER_UNIT CODEX_SYSTEMCTL
 }
 
 # The app-server is a process boundary, mocked the same way the WHAM endpoint and
@@ -191,6 +192,23 @@ setup_sandbox() {
 # "$APPSERVER/killed" instead of signalling a real process.
 set_appserver_pid() { printf '%s' "$1" > "$APPSERVER/pid"; }
 killed_pids() { cat "$APPSERVER/killed" 2>/dev/null; }
+replaced_how() { cat "$APPSERVER/replaced" 2>/dev/null; }
+systemctl_calls() { cat "$APPSERVER/systemctl" 2>/dev/null; }
+
+# Pretends a systemd user unit owns the app-server. The stub stands in for the
+# systemctl process boundary the same way the WHAM endpoint is stood in for: it
+# records its arguments and exits "$2" (default 0) instead of touching real units.
+set_appserver_unit() {
+    local unit="$1" rc="${2:-0}"
+    cat > "$SB/systemctl.sh" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$APPSERVER/systemctl"
+exit $rc
+EOF
+    chmod 700 "$SB/systemctl.sh"
+    CODEX_APPSERVER_UNIT="$unit"
+    CODEX_SYSTEMCTL="$SB/systemctl.sh"
+}
 
 # Writes an executable stub and points CODEX_INFLIGHT_CMD at it. The stub prints
 # "$1" (empty means no work in flight) and exits with "$2".
@@ -219,6 +237,8 @@ run_rotate() {
         CODEX_REFRESH_MOCK_DIR="$REFRESH" \
         CODEX_APPSERVER_MOCK_DIR="$APPSERVER" \
         CODEX_INFLIGHT_CMD="${CODEX_INFLIGHT_CMD:-}" \
+        CODEX_APPSERVER_UNIT="${CODEX_APPSERVER_UNIT:-}" \
+        CODEX_SYSTEMCTL="${CODEX_SYSTEMCTL:-/bin/false}" \
         CODEX_APPSERVER_RESTART="${CODEX_APPSERVER_RESTART:-1}" \
             bash "$ROTATE" "$@" 2>&1
     )
@@ -242,6 +262,8 @@ run_rotate_default_inflight() {
         CODEX_REFRESH_MOCK_DIR="$REFRESH" \
         CODEX_APPSERVER_MOCK_DIR="$APPSERVER" \
         CODEX_APPSERVER_SOCKET="$CODEX_APPSERVER_SOCKET" \
+        CODEX_APPSERVER_UNIT="${CODEX_APPSERVER_UNIT:-}" \
+        CODEX_SYSTEMCTL="${CODEX_SYSTEMCTL:-/bin/false}" \
         CODEX_APPSERVER_RESTART="${CODEX_APPSERVER_RESTART:-1}" \
         env -u CODEX_INFLIGHT_CMD \
             bash "$ROTATE" "$@" 2>&1
@@ -1401,6 +1423,85 @@ scenario_appserver_restart_can_be_disabled() {
     assert_eq "" "$(killed_pids)" "restart disabled killed nothing"
 }
 
+# --- who replaces the app-server -------------------------------------------------
+# A signal alone only works where an external supervisor respawns the process.
+# When a systemd user unit owns it, the unit is the only thing that brings it
+# back, so a swap must restart the unit or the box is left with no app-server.
+
+scenario_unit_owned_appserver_restarts_the_unit() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    set_appserver_unit codex-remote-control.service
+
+    run_rotate
+
+    assert_exit 0 "$RC" "unit owned restart exit"
+    assert_active acctB "unit owned restart still performed the swap"
+    assert_eq "--user restart codex-remote-control.service" "$(systemctl_calls)" \
+        "unit owned app-server was replaced by restarting its unit"
+    assert_eq "4242 unit:codex-remote-control.service" "$(replaced_how)" \
+        "unit owned app-server recorded the unit lever"
+    assert_contains "$OUT" "app-server restarted via codex-remote-control.service" \
+        "unit owned restart logged the unit it used"
+}
+
+scenario_unit_restart_failure_falls_back_to_the_signal() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    # A unit that refuses to restart would otherwise leave the daemon serving
+    # the account the swap just moved away from.
+    set_appserver_unit codex-remote-control.service 1
+
+    run_rotate
+
+    assert_exit 0 "$RC" "unit restart failure exit"
+    assert_active acctB "unit restart failure still performed the swap"
+    assert_eq "4242 signal" "$(replaced_how)" \
+        "a unit that will not restart falls back to the signal"
+    assert_eq "4242" "$(killed_pids)" "fallback still replaced the process"
+}
+
+scenario_unit_lookup_never_targets_the_session_manager() {
+    # Restarting user@N.service would tear down every user service on the box,
+    # this rotator's own timer included, to swap one token.
+    local out
+    out=$(
+        CODEX_ROTATOR_STORE="$STORE" ROTATOR_CONFIG="$CONFIG" \
+            bash -c '
+                source "$1"
+                printf "leaf=[%s]\n" "$(codex_unit_from_cgroup \
+                    "0::/user.slice/user-1000.slice/user@1000.service/app.slice/codex-remote-control.service")"
+                printf "manager=[%s]\n" "$(codex_unit_from_cgroup \
+                    "0::/user.slice/user-1000.slice/user@1000.service")"
+                printf "scope=[%s]\n" "$(codex_unit_from_cgroup \
+                    "0::/user.slice/user-1000.slice/session-208.scope")"
+                printf "empty=[%s]\n" "$(codex_unit_from_cgroup "")"
+            ' _ "$CODEX_LIB"
+    )
+    assert_contains "$out" "leaf=[codex-remote-control.service]" \
+        "the owning unit is the leaf of the cgroup path"
+    assert_contains "$out" "manager=[]" \
+        "the per-user session manager is never a restart target"
+    assert_contains "$out" "scope=[]" \
+        "a process in a bare scope has no unit to restart"
+    assert_contains "$out" "empty=[]" \
+        "an unreadable cgroup yields no unit"
+}
+
 scenario_status_never_kills_appserver() {
     make_config "acctA acctB"
     seed_account acctA "accessA" "accountA"
@@ -1680,6 +1781,9 @@ run_scenario "Swap restarts the app-server"                      scenario_swap_r
 run_scenario "Absent app-server is not an error"                 scenario_no_appserver_running_is_not_an_error
 run_scenario "Rolled back swap leaves the app-server alone"      scenario_rolled_back_swap_leaves_appserver_alone
 run_scenario "App-server restart can be disabled"                scenario_appserver_restart_can_be_disabled
+run_scenario "Unit owned app-server restarts its unit"          scenario_unit_owned_appserver_restarts_the_unit
+run_scenario "Unit restart failure falls back to the signal"    scenario_unit_restart_failure_falls_back_to_the_signal
+run_scenario "Unit lookup never targets the session manager"    scenario_unit_lookup_never_targets_the_session_manager
 run_scenario "Status never kills the app-server"                 scenario_status_never_kills_appserver
 run_scenario "In-flight work blocks the swap"                    scenario_inflight_work_blocks_swap
 run_scenario "Unknown in-flight state blocks the swap"           scenario_inflight_probe_failure_holds
