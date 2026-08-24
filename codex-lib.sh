@@ -369,6 +369,17 @@ codex_kill_appserver() {
 
     unit=$(codex_appserver_unit "$pid")
     if [ -n "$unit" ]; then
+        # Drop the unit's processes first, then bring the unit back. Two reasons
+        # this is not a plain `systemctl restart`. The swap has already moved
+        # auth.json and the in-flight probe has already run, so every second the
+        # old daemon stays up is a second a new turn can start on the account we
+        # just moved away from and then be killed anyway. And this unit stops by
+        # waiting on the daemon's pid, which ignores SIGTERM, so `restart` alone
+        # sits through that whole timeout: 70s, observed 2026-08-24. Signalling
+        # the cgroup also takes out the supervisor that would otherwise hold the
+        # killed daemon as an unreaped zombie, which is what the stop was stuck
+        # waiting on.
+        "${CODEX_SYSTEMCTL:-systemctl}" --user kill --signal=KILL "$unit" >/dev/null 2>&1
         if "${CODEX_SYSTEMCTL:-systemctl}" --user restart "$unit" >/dev/null 2>&1; then
             CODEX_APPSERVER_METHOD="unit:$unit"
             codex_appserver_record "$pid" "$CODEX_APPSERVER_METHOD" || return 1

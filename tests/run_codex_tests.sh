@@ -1444,8 +1444,9 @@ scenario_unit_owned_appserver_restarts_the_unit() {
 
     assert_exit 0 "$RC" "unit owned restart exit"
     assert_active acctB "unit owned restart still performed the swap"
-    assert_eq "--user restart codex-remote-control.service" "$(systemctl_calls)" \
-        "unit owned app-server was replaced by restarting its unit"
+    assert_eq "--user kill --signal=KILL codex-remote-control.service
+--user restart codex-remote-control.service" "$(systemctl_calls)" \
+        "unit owned app-server was dropped before its unit was brought back"
     assert_eq "4242 unit:codex-remote-control.service" "$(replaced_how)" \
         "unit owned app-server recorded the unit lever"
     assert_contains "$OUT" "app-server restarted via codex-remote-control.service" \
@@ -1473,6 +1474,8 @@ scenario_unit_restart_failure_falls_back_to_the_signal() {
     assert_eq "4242 signal" "$(replaced_how)" \
         "a unit that will not restart falls back to the signal"
     assert_eq "4242" "$(killed_pids)" "fallback still replaced the process"
+    assert_contains "$(systemctl_calls)" "--user restart codex-remote-control.service" \
+        "the fallback only happens after the unit was actually tried"
 }
 
 scenario_unit_lookup_never_targets_the_session_manager() {

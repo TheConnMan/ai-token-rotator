@@ -348,9 +348,15 @@ provider credentials. See `README.md` for operator setup.
   leaves the box with no app-server at all. The owning systemd user unit is read from
   the pid's `/proc/<pid>/cgroup`, overridable with `CODEX_APPSERVER_UNIT`; an empty
   `CODEX_APPSERVER_UNIT` forces the signal.
-  - A unit owns it: `systemctl --user restart <unit>`. A signal alone would not bring
-    it back, because the unit that ships the daemon is `Type=oneshot` with
-    `RemainAfterExit=yes` and stays `active` over a dead process.
+  - A unit owns it: `systemctl --user kill --signal=KILL <unit>`, then
+    `systemctl --user restart <unit>`. A signal alone would not bring it back, because
+    the unit that ships the daemon is `Type=oneshot` with `RemainAfterExit=yes` and
+    stays `active` over a dead process. A restart alone is not enough either: the swap
+    has already moved `auth.json`, so every second the old daemon stays up is a second
+    a new turn can start on the account just moved away from, and this unit stops by
+    waiting on a pid that ignores SIGTERM, which took 70s on 2026-08-24. Signalling the
+    cgroup also removes the supervisor that would otherwise hold the killed daemon as
+    an unreaped zombie, which is what that stop was waiting on.
   - Nothing owns it: SIGKILL, and it respawns on the next Codex Desktop connect and
     reads the new account then. The process ignores SIGTERM, so the kill is SIGKILL.
   - A unit that fails to restart falls back to the signal, because a unit that will
