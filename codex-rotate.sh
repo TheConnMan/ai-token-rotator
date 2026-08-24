@@ -352,9 +352,23 @@ if [ "$SHOULD_SWAP" -eq 1 ]; then
             if [ "$CODEX_APPSERVER_RESTART" = "1" ]; then
                 codex_kill_appserver
                 case $? in
-                    0) codex_log "app-server killed to pick up $target; it respawns on the next Codex Desktop connect" ;;
+                    0)
+                        case "$CODEX_APPSERVER_METHOD" in
+                            unit:*)
+                                codex_log "app-server restarted via ${CODEX_APPSERVER_METHOD#unit:} to pick up $target" ;;
+                            *)
+                                codex_log "app-server killed to pick up $target; it respawns on the next Codex Desktop connect" ;;
+                        esac
+                        ;;
                     2) codex_log "no app-server running; nothing to restart for $target" ;;
-                    *) codex_log "app-server restart FAILED; Codex work keeps using $ACTIVE until the process is replaced" ;;
+                    *)
+                        case "$CODEX_APPSERVER_METHOD" in
+                            unit:*)
+                                codex_log "app-server did NOT come back after restarting ${CODEX_APPSERVER_METHOD#unit:}; no Codex work can run until it does" ;;
+                            *)
+                                codex_log "app-server restart FAILED; Codex work keeps using $ACTIVE until the process is replaced" ;;
+                        esac
+                        ;;
                 esac
             fi
         else

@@ -341,11 +341,41 @@ provider credentials. See `README.md` for operator setup.
 8. Codex status is read only. It never refreshes, writes usage or logs,
   swaps auth, updates the pointer, or otherwise mutates provider state.
 9. A swap alone reaches no Codex work. The app-server reads `auth.json` once at
-  startup and caches that account for its whole lifetime, so the rotator kills the
-  app-server after a swap that fully succeeded. It respawns on the next Codex
-  Desktop connect and reads the new account then. `CODEX_APPSERVER_RESTART=0`
-  disables the kill. The process ignores SIGTERM, so the kill is SIGKILL, and it is
-  located by the pid listening on `CODEX_APPSERVER_SOCKET`.
+  startup and caches that account for its whole lifetime, so the rotator replaces the
+  app-server after a swap that fully succeeded. It is located by the pid listening on
+  `CODEX_APPSERVER_SOCKET`, and `CODEX_APPSERVER_RESTART=0` disables the replacement.
+
+9a. Which lever replaces it depends on who owns the process, because the wrong lever
+  leaves the box with no app-server at all. The owning systemd user unit is read from
+  the pid's `/proc/<pid>/cgroup`, overridable with `CODEX_APPSERVER_UNIT`; an empty
+  `CODEX_APPSERVER_UNIT` forces the signal.
+  - A unit owns it: `systemctl --user kill --signal=KILL <unit>`, then
+    `systemctl --user restart <unit>`. A signal alone would not bring it back, because
+    the unit that ships the daemon is `Type=oneshot` with `RemainAfterExit=yes` and
+    stays `active` over a dead process. A restart alone is not enough either: the swap
+    has already moved `auth.json`, so every second the old daemon stays up is a second
+    a new turn can start on the account just moved away from, and this unit stops by
+    waiting on a pid that ignores SIGTERM, which took 70s on 2026-08-24. Signalling the
+    cgroup also removes the supervisor that would otherwise hold the killed daemon as
+    an unreaped zombie, which is what that stop was waiting on.
+  - Nothing owns it: SIGKILL, and it respawns on the next Codex Desktop connect and
+    reads the new account then. The process ignores SIGTERM, so the kill is SIGKILL.
+  - A unit that fails to restart falls back to the signal only when the kill did not
+    land, because then the daemon may still be up serving the account the swap moved
+    away from. When the kill did land there is nothing left to signal, and the tick
+    reports the outage instead of claiming the old account is still in use.
+  - A restart that reports success is not proof of a running daemon. A `Type=oneshot`
+    `ExecStart` exits 0 once it has spawned the app-server, and systemd reports
+    `active` either way, so the rotator waits up to `CODEX_APPSERVER_WAIT_SECS` (15)
+    for a pid to be listening on the socket again and reports a failure when none
+    turns up. Taking the restart at its word is how the box ends up with no
+    app-server, which no later tick repairs: a tick that finds no listening pid
+    concludes there is nothing to restart.
+  - `user@N.service` is never a restart target. It is the per-user session manager,
+    and restarting it would tear down every user service on the box. This holds for an
+    explicit `CODEX_APPSERVER_UNIT` too: an override that could still name it would
+    just be the same accident with an extra step. A refused unit falls back to the
+    signal.
 10. Killing the app-server interrupts every running turn, so no swap fires while
   Codex work is in flight. `CODEX_INFLIGHT_CMD` is the probe: non-empty stdout means
   work is in flight. Unset uses the bundled `codex-inflight.sh`. An empty value

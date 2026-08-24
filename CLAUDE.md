@@ -74,11 +74,25 @@ Each of these exists because it broke something. Do not "simplify" one away.
   slot, so match on `limit_window_seconds`. Requiring both windows made every healthy
   account read as unknown; defaulting a missing one to zero would make it win every
   comparison.
-* **A swap must restart the app-server.** The app-server reads `auth.json` once at
-  startup and caches that account forever, so a swap alone reaches no Codex work at
-  all. It is spawned unmanaged by Codex Desktop over SSH, so `codex app-server daemon
-  restart` cannot manage it, and it ignores SIGTERM. SIGKILL plus Desktop's respawn is
-  the only lever, verified 2026-08-19 in both directions.
+* **A swap must replace the app-server, using whichever lever actually respawns it.**
+  The app-server reads `auth.json` once at startup and caches that account forever, so
+  a swap alone reaches no Codex work at all. It ignores SIGTERM, hence SIGKILL. Which
+  lever is correct depends on who owns the process, and picking the wrong one strands
+  the box with no app-server at all:
+  * **Owned by a systemd user unit** (`codex-remote-control.service` here): restart the
+    unit. A bare SIGKILL is not enough, because that unit is `Type=oneshot` with
+    `RemainAfterExit=yes`, so its main pid has already exited successfully and systemd
+    keeps reporting `active` over a corpse. Nothing respawns it and every later
+    dispatch fails. This is what happened on 2026-08-24: a Trigger B swap killed the
+    daemon at 14:58 and no new Codex job could start until the unit was restarted.
+  * **Owned by nothing** (the older arrangement, spawned unmanaged by Codex Desktop over
+    SSH, verified 2026-08-19): SIGKILL and let Desktop respawn it on its next connect.
+
+  `codex_kill_appserver` picks between them by reading the owning unit out of
+  `/proc/<pid>/cgroup`, and falls back to the signal when the unit refuses to restart.
+  It must never resolve `user@N.service` as the target: that is the per-user session
+  manager, and restarting it would tear down every user service on the box, this
+  rotator's own timer included, to swap one token.
 * **Never swap while Codex work is in flight.** The restart above interrupts every
   running turn, proven by a live mid-turn kill. `CODEX_INFLIGHT_CMD` gates it, and an
   unanswerable probe counts as in flight. Waiting one tick is cheap; killing a running
