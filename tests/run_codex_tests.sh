@@ -1820,6 +1820,30 @@ scenario_status_never_runs_the_backstop() {
     assert_eq "" "$(systemctl_calls)" "status must never start the backstop unit"
 }
 
+scenario_listening_socket_without_a_pid_is_unknown() {
+    # ss can list a listening socket without attributing it to a process. That
+    # is something running, not nothing running, and reading it as absence would
+    # let the backstop restart a live app-server under running turns.
+    local out
+    out=$(
+        bash -c '
+            source "$1"
+            attributed="u_str LISTEN 0 4096 /tmp/as.sock 123 * 0 users:((\"codex\",pid=1200483,fd=34))"
+            bare="u_str LISTEN 0 4096 /tmp/as.sock 123 * 0"
+            other="u_str LISTEN 0 4096 /tmp/other.sock 9 * 0 users:((\"x\",pid=5,fd=3))"
+            printf "attributed=[%s] rc=%s\n" "$(codex_pid_from_listeners "$attributed" /tmp/as.sock)" "$?"
+            printf "bare=[%s] rc=%s\n" "$(codex_pid_from_listeners "$bare" /tmp/as.sock)" "$?"
+            printf "absent=[%s] rc=%s\n" "$(codex_pid_from_listeners "$other" /tmp/as.sock)" "$?"
+        ' _ "$CODEX_LIB"
+    )
+    assert_contains "$out" "attributed=[1200483] rc=0" \
+        "an attributed socket reports its pid"
+    assert_contains "$out" "bare=[] rc=3" \
+        "a listening socket with no pid is unknown, not absent"
+    assert_contains "$out" "absent=[] rc=0" \
+        "no matching socket is a confirmed absence"
+}
+
 scenario_status_never_kills_appserver() {
     make_config "acctA acctB"
     seed_account acctA "accessA" "accountA"
@@ -2112,6 +2136,7 @@ run_scenario "Backstop skips the tick that replaced it"        scenario_backstop
 run_scenario "Backstop refuses the session manager"            scenario_backstop_refuses_the_session_manager
 run_scenario "Backstop reports a unit that produced nothing"   scenario_backstop_reports_a_unit_that_produced_nothing
 run_scenario "Backstop is off by default"                      scenario_backstop_is_off_by_default
+run_scenario "Listening socket without a pid is unknown"       scenario_listening_socket_without_a_pid_is_unknown
 run_scenario "Backstop holds when the probe cannot answer"     scenario_backstop_holds_when_the_probe_cannot_answer
 run_scenario "Backstop runs on an early exit tick"             scenario_backstop_runs_on_an_early_exit_tick
 run_scenario "Status never runs the backstop"                  scenario_status_never_runs_the_backstop

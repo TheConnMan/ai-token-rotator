@@ -318,11 +318,25 @@ codex_appserver_pid() {
     fi
     [ -n "$CODEX_APPSERVER_SOCKET" ] || return 0
     listeners=$(ss -xlp 2>/dev/null) || return 1
-    printf '%s\n' "$listeners" | awk -v sock="$CODEX_APPSERVER_SOCKET" '
-        index($0, sock) > 0 && match($0, /pid=[0-9]+/) {
-            print substr($0, RSTART + 4, RLENGTH - 4)
-            exit
-        }'
+    codex_pid_from_listeners "$listeners" "$CODEX_APPSERVER_SOCKET"
+}
+
+# The pid listening on a socket in an `ss -xlp` listing. Kept separate from the
+# ss call so the three outcomes are exercised directly. Absent socket is empty
+# and 0; a matched socket yields its pid; a matched socket with no pid= is
+# something listening that could not be attributed, which is unknown, not
+# absence, so it fails rather than reporting nobody home.
+codex_pid_from_listeners() {
+    printf '%s\n' "$1" | awk -v sock="$2" '
+        index($0, sock) > 0 {
+            seen = 1
+            if (match($0, /pid=[0-9]+/)) {
+                print substr($0, RSTART + 4, RLENGTH - 4)
+                found = 1
+                exit 0
+            }
+        }
+        END { if (seen && !found) exit 3 }'
 }
 
 # The systemd user unit that owns the app-server, empty when none does.

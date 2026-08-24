@@ -19,7 +19,11 @@ source "$HERE/codex-lib.sh"
 
 # No app-server means no turns are running, which is a real answer, not an unknown.
 [ -S "$CODEX_APPSERVER_SOCKET" ] || exit 0
-[ -n "$(codex_appserver_pid)" ] || exit 0
+# A pid lookup that cannot answer is not "nothing is running". Exit non-zero so
+# the rotator reads it as in flight and holds, rather than swapping under work
+# it merely failed to see.
+appserver_pid=$(codex_appserver_pid) || exit 1
+[ -n "$appserver_pid" ] || exit 0
 
 python3 - "$CODEX_APPSERVER_SOCKET" <<'PY'
 import json, os, socket, struct, sys

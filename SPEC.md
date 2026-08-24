@@ -386,9 +386,12 @@ provider credentials. See `README.md` for operator setup.
   socket. `status` never runs it, being a dry read.
 
 9c. Only a confirmed absence starts the backstop unit. `codex_appserver_pid`
-  separates "nothing is listening", which is empty output with exit 0, from "the
-  question could not be asked", which is exit 1, and the backstop holds on the
-  latter. Reading an unanswerable probe as an absence would replace a live
+  separates "nothing is listening", empty output with exit 0, from "the question
+  could not be asked", a non-zero exit, and the backstop holds on the latter. The
+  question counts as unanswerable when `ss` itself fails and, just as importantly,
+  when it lists the socket without a `pid=`: a listening socket nobody could
+  attribute is something running, not nothing running. The same non-zero reaches
+  `codex-inflight.sh`, which reports it as in flight so no swap fires on it. Reading an unanswerable probe as an absence would replace a live
   app-server on every tick, with no in-flight gate in front of it. Once absence is
   confirmed there are no turns to interrupt, so no in-flight probe is needed.
 
