@@ -184,6 +184,7 @@ setup_sandbox() {
     chmod 700 "$STORE"
     unset CODEX_INFLIGHT_CMD CODEX_APPSERVER_RESTART CODEX_APPSERVER_SOCKET
     unset CODEX_APPSERVER_UNIT CODEX_SYSTEMCTL CODEX_APPSERVER_WAIT_SECS
+    unset CODEX_APPSERVER_BACKSTOP_UNIT
 }
 
 # The app-server is a process boundary, mocked the same way the WHAM endpoint and
@@ -206,6 +207,7 @@ set_appserver_unit() {
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" >> "$APPSERVER/systemctl"
 [ "$vanish" = vanish ] && [ "\$2" = restart ] && : > "$APPSERVER/pid"
+[ "$vanish" = spawn ] && [ "\$2" = restart ] && printf '%s' 9931 > "$APPSERVER/pid"
 [ "\$2" = kill ] && exit $killrc
 exit $rc
 EOF
@@ -244,6 +246,7 @@ run_rotate() {
         CODEX_APPSERVER_UNIT="${CODEX_APPSERVER_UNIT:-}" \
         CODEX_SYSTEMCTL="${CODEX_SYSTEMCTL:-/bin/false}" \
         CODEX_APPSERVER_WAIT_SECS="${CODEX_APPSERVER_WAIT_SECS:-15}" \
+        CODEX_APPSERVER_BACKSTOP_UNIT="${CODEX_APPSERVER_BACKSTOP_UNIT:-}" \
         CODEX_APPSERVER_RESTART="${CODEX_APPSERVER_RESTART:-1}" \
             bash "$ROTATE" "$@" 2>&1
     )
@@ -270,6 +273,7 @@ run_rotate_default_inflight() {
         CODEX_APPSERVER_UNIT="${CODEX_APPSERVER_UNIT:-}" \
         CODEX_SYSTEMCTL="${CODEX_SYSTEMCTL:-/bin/false}" \
         CODEX_APPSERVER_WAIT_SECS="${CODEX_APPSERVER_WAIT_SECS:-15}" \
+        CODEX_APPSERVER_BACKSTOP_UNIT="${CODEX_APPSERVER_BACKSTOP_UNIT:-}" \
         CODEX_APPSERVER_RESTART="${CODEX_APPSERVER_RESTART:-1}" \
         env -u CODEX_INFLIGHT_CMD \
             bash "$ROTATE" "$@" 2>&1
@@ -1609,6 +1613,141 @@ scenario_session_manager_override_is_refused() {
         "a refused unit override replaces the process by signal instead"
 }
 
+# --- the backstop ---------------------------------------------------------------
+# Handing the respawn to an external supervisor fails silently when that
+# supervisor is gone. A later tick repairs the box rather than concluding there
+# is nothing to restart.
+
+scenario_backstop_starts_an_absent_appserver() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    # No trigger, so this tick only observes: the strand happened earlier.
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_unit codex-remote-control.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+
+    run_rotate
+
+    assert_exit 0 "$RC" "backstop exit"
+    assert_active acctA "backstop tick did not swap"
+    assert_contains "$OUT" "started one via codex-remote-control.service" \
+        "a tick that found no app-server started one"
+    assert_contains "$(systemctl_calls)" "--user restart codex-remote-control.service" \
+        "the backstop restarts the unit rather than starting it"
+}
+
+scenario_backstop_is_quiet_when_an_appserver_is_up() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    set_appserver_unit codex-remote-control.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+
+    run_rotate
+
+    assert_exit 0 "$RC" "backstop quiet exit"
+    assert_eq "" "$(systemctl_calls)" \
+        "a listening app-server is left alone"
+}
+
+scenario_backstop_skips_the_tick_that_replaced_it() {
+    # The signal path has just handed the respawn to Codex Desktop. Starting a
+    # unit in the same breath would race it for the socket.
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+
+    run_rotate
+
+    assert_exit 0 "$RC" "backstop skip exit"
+    assert_active acctB "the swap still happened"
+    assert_eq "4242" "$(killed_pids)" "the swap replaced the process by signal"
+    assert_eq "" "$(systemctl_calls)" \
+        "the tick that signalled does not also start the backstop unit"
+}
+
+scenario_backstop_refuses_the_session_manager() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_unit user@1000.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=user@1000.service
+
+    run_rotate
+
+    assert_exit 0 "$RC" "backstop session manager exit"
+    assert_eq "" "$(systemctl_calls)" \
+        "the session manager is never started as a backstop either"
+}
+
+scenario_backstop_reports_a_unit_that_produced_nothing() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    # Restart reports success, no daemon appears.
+    set_appserver_unit codex-remote-control.service 0
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+    CODEX_APPSERVER_WAIT_SECS=0
+
+    run_rotate
+
+    assert_exit 0 "$RC" "backstop produced nothing exit"
+    assert_contains "$OUT" "produced none; no Codex work can run" \
+        "a backstop that produced no daemon said so"
+}
+
+scenario_backstop_is_off_by_default() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_unit codex-remote-control.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+
+    run_rotate
+
+    assert_exit 0 "$RC" "backstop default exit"
+    assert_eq "" "$(systemctl_calls)" \
+        "an unconfigured backstop touches no unit"
+    assert_not_contains "$OUT" "started one via" "an unconfigured backstop stays silent"
+}
+
 scenario_status_never_kills_appserver() {
     make_config "acctA acctB"
     seed_account acctA "accessA" "accountA"
@@ -1895,6 +2034,12 @@ run_scenario "Unit restart without a daemon is a failure"      scenario_unit_res
 run_scenario "Dropped unit that will not restart never signals" scenario_dropped_unit_that_will_not_restart_never_signals
 run_scenario "Session manager override is refused"             scenario_session_manager_override_is_refused
 run_scenario "Unit lookup never targets the session manager"    scenario_unit_lookup_never_targets_the_session_manager
+run_scenario "Backstop starts an absent app-server"            scenario_backstop_starts_an_absent_appserver
+run_scenario "Backstop is quiet when an app-server is up"      scenario_backstop_is_quiet_when_an_appserver_is_up
+run_scenario "Backstop skips the tick that replaced it"        scenario_backstop_skips_the_tick_that_replaced_it
+run_scenario "Backstop refuses the session manager"            scenario_backstop_refuses_the_session_manager
+run_scenario "Backstop reports a unit that produced nothing"   scenario_backstop_reports_a_unit_that_produced_nothing
+run_scenario "Backstop is off by default"                      scenario_backstop_is_off_by_default
 run_scenario "Status never kills the app-server"                 scenario_status_never_kills_appserver
 run_scenario "In-flight work blocks the swap"                    scenario_inflight_work_blocks_swap
 run_scenario "Unknown in-flight state blocks the swap"           scenario_inflight_probe_failure_holds

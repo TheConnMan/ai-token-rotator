@@ -93,6 +93,14 @@ Each of these exists because it broke something. Do not "simplify" one away.
   It must never resolve `user@N.service` as the target: that is the per-user session
   manager, and restarting it would tear down every user service on the box, this
   rotator's own timer included, to swap one token.
+* **A tick that finds no app-server heals instead of shrugging.** The signal path only
+  works while its external supervisor is around, and the daemon can end up owned by
+  either arrangement depending on who last started it, so the signal path stays
+  reachable. Its silent failure is what stranded the box on 2026-08-24. A live tick
+  that finds nothing listening restarts `CODEX_APPSERVER_BACKSTOP_UNIT`. The tick that
+  did the replacing skips it, or it would race Desktop for the socket; the wait is one
+  interval. Do not let a "nothing is running, so nothing to restart" branch come back:
+  that reasoning is exactly what made the outage self-concealing.
 * **Never swap while Codex work is in flight.** The restart above interrupts every
   running turn, proven by a live mid-turn kill. `CODEX_INFLIGHT_CMD` gates it, and an
   unanswerable probe counts as in flight. Waiting one tick is cheap; killing a running

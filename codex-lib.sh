@@ -21,6 +21,9 @@ CODEX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CODEX_ROTATOR_AUTH:=$HOME/.codex/auth.json}"
 : "${CODEX_ROTATOR_STORE:=$HOME/.codex/accounts}"
 : "${CODEX_APPSERVER_RESTART:=1}"
+# The unit that can bring an app-server back when nothing is listening and no
+# external supervisor did. Empty disables the backstop.
+: "${CODEX_APPSERVER_BACKSTOP_UNIT:=}"
 : "${CODEX_APPSERVER_SOCKET:=${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock}"
 # Unset uses the bundled probe. Empty is the operator/test escape that
 # disables the gate. Use +x, not :=, because := treats empty as unset and
@@ -369,6 +372,32 @@ codex_await_appserver() {
         sleep 1
         waited=$((waited + 1))
     done
+}
+
+# Bring an app-server back when none is listening. The signal path hands the
+# respawn to an external supervisor, Codex Desktop on its next connect. That
+# works while the supervisor is around and fails silently when it is not: the box
+# keeps no app-server at all, and nothing repairs it, because a tick that finds
+# no listening pid concludes there is nothing to restart and returns 2. This is
+# that repair. Empty CODEX_APPSERVER_BACKSTOP_UNIT disables it.
+# 0 an app-server is listening again, 2 nothing to do, 1 the unit produced none.
+# CODEX_APPSERVER_BACKSTOP_UNIT_USED is read by codex-rotate.sh to name the unit
+# in the log, the same way CODEX_APPSERVER_METHOD is.
+# shellcheck disable=SC2034
+codex_ensure_appserver() {
+    local unit
+    CODEX_APPSERVER_BACKSTOP_UNIT_USED=""
+    unit=$(codex_restartable_unit "$CODEX_APPSERVER_BACKSTOP_UNIT")
+    [ -n "$unit" ] || return 2
+    [ -z "$(codex_appserver_pid)" ] || return 2
+    CODEX_APPSERVER_BACKSTOP_UNIT_USED="$unit"
+    # restart, not start. The unit keeps reporting active through
+    # RemainAfterExit with no daemon behind it, so start is a no-op on exactly
+    # the state this repairs. The kill first clears any supervisor still holding
+    # a dead pid, which would otherwise stall the unit's stop path.
+    "${CODEX_SYSTEMCTL:-systemctl}" --user kill --signal=KILL "$unit" >/dev/null 2>&1
+    "${CODEX_SYSTEMCTL:-systemctl}" --user restart "$unit" >/dev/null 2>&1 || return 1
+    codex_await_appserver
 }
 
 # Record for the tests, which cannot observe a signal or a systemctl call.

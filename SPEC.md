@@ -376,6 +376,15 @@ provider credentials. See `README.md` for operator setup.
     explicit `CODEX_APPSERVER_UNIT` too: an override that could still name it would
     just be the same accident with an extra step. A refused unit falls back to the
     signal.
+9b. Replacing by signal leaves the respawn to an external supervisor, which is
+  silent when that supervisor is gone. A live tick that finds nothing listening on
+  the socket therefore restarts `CODEX_APPSERVER_BACKSTOP_UNIT` to bring an
+  app-server back, and reports it when the unit produces none. Empty disables the
+  backstop and is the default; `user@N.service` is refused here too. The tick that
+  did the replacing skips this, because its own signal has just handed the respawn
+  to the supervisor and starting a unit in the same breath would race it for the
+  socket. `status` never runs it, being a dry read.
+
 10. Killing the app-server interrupts every running turn, so no swap fires while
   Codex work is in flight. `CODEX_INFLIGHT_CMD` is the probe: non-empty stdout means
   work is in flight. Unset uses the bundled `codex-inflight.sh`. An empty value
