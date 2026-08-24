@@ -361,6 +361,13 @@ provider credentials. See `README.md` for operator setup.
     reads the new account then. The process ignores SIGTERM, so the kill is SIGKILL.
   - A unit that fails to restart falls back to the signal, because a unit that will
     not restart still leaves the daemon serving the account the swap moved away from.
+  - A restart that reports success is not proof of a running daemon. A `Type=oneshot`
+    `ExecStart` exits 0 once it has spawned the app-server, and systemd reports
+    `active` either way, so the rotator waits up to `CODEX_APPSERVER_WAIT_SECS` (15)
+    for a pid to be listening on the socket again and reports a failure when none
+    turns up. Taking the restart at its word is how the box ends up with no
+    app-server, which no later tick repairs: a tick that finds no listening pid
+    concludes there is nothing to restart.
   - `user@N.service` is never a restart target. It is the per-user session manager,
     and restarting it would tear down every user service on the box. This holds for an
     explicit `CODEX_APPSERVER_UNIT` too: an override that could still name it would

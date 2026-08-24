@@ -351,7 +351,14 @@ if [ "$SHOULD_SWAP" -eq 1 ]; then
                         esac
                         ;;
                     2) codex_log "no app-server running; nothing to restart for $target" ;;
-                    *) codex_log "app-server restart FAILED; Codex work keeps using $ACTIVE until the process is replaced" ;;
+                    *)
+                        case "$CODEX_APPSERVER_METHOD" in
+                            unit:*)
+                                codex_log "app-server did NOT come back after restarting ${CODEX_APPSERVER_METHOD#unit:}; no Codex work can run until it does" ;;
+                            *)
+                                codex_log "app-server restart FAILED; Codex work keeps using $ACTIVE until the process is replaced" ;;
+                        esac
+                        ;;
                 esac
             fi
         else

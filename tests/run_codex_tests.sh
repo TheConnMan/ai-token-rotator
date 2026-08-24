@@ -183,7 +183,7 @@ setup_sandbox() {
     mkdir -p "$STORE" "$(dirname "$AUTH")" "$MOCK" "$REFRESH" "$APPSERVER"
     chmod 700 "$STORE"
     unset CODEX_INFLIGHT_CMD CODEX_APPSERVER_RESTART CODEX_APPSERVER_SOCKET
-    unset CODEX_APPSERVER_UNIT CODEX_SYSTEMCTL
+    unset CODEX_APPSERVER_UNIT CODEX_SYSTEMCTL CODEX_APPSERVER_WAIT_SECS
 }
 
 # The app-server is a process boundary, mocked the same way the WHAM endpoint and
@@ -198,11 +198,14 @@ systemctl_calls() { cat "$APPSERVER/systemctl" 2>/dev/null; }
 # Pretends a systemd user unit owns the app-server. The stub stands in for the
 # systemctl process boundary the same way the WHAM endpoint is stood in for: it
 # records its arguments and exits "$2" (default 0) instead of touching real units.
+# A third argument of "vanish" makes the stub clear the mocked pid, standing in
+# for a unit whose ExecStart exits 0 without the detached daemon ever coming up.
 set_appserver_unit() {
-    local unit="$1" rc="${2:-0}"
+    local unit="$1" rc="${2:-0}" vanish="${3:-}"
     cat > "$SB/systemctl.sh" <<EOF
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" >> "$APPSERVER/systemctl"
+[ "$vanish" = vanish ] && [ "\$2" = restart ] && : > "$APPSERVER/pid"
 exit $rc
 EOF
     chmod 700 "$SB/systemctl.sh"
@@ -239,6 +242,7 @@ run_rotate() {
         CODEX_INFLIGHT_CMD="${CODEX_INFLIGHT_CMD:-}" \
         CODEX_APPSERVER_UNIT="${CODEX_APPSERVER_UNIT:-}" \
         CODEX_SYSTEMCTL="${CODEX_SYSTEMCTL:-/bin/false}" \
+        CODEX_APPSERVER_WAIT_SECS="${CODEX_APPSERVER_WAIT_SECS:-15}" \
         CODEX_APPSERVER_RESTART="${CODEX_APPSERVER_RESTART:-1}" \
             bash "$ROTATE" "$@" 2>&1
     )
@@ -264,6 +268,7 @@ run_rotate_default_inflight() {
         CODEX_APPSERVER_SOCKET="$CODEX_APPSERVER_SOCKET" \
         CODEX_APPSERVER_UNIT="${CODEX_APPSERVER_UNIT:-}" \
         CODEX_SYSTEMCTL="${CODEX_SYSTEMCTL:-/bin/false}" \
+        CODEX_APPSERVER_WAIT_SECS="${CODEX_APPSERVER_WAIT_SECS:-15}" \
         CODEX_APPSERVER_RESTART="${CODEX_APPSERVER_RESTART:-1}" \
         env -u CODEX_INFLIGHT_CMD \
             bash "$ROTATE" "$@" 2>&1
@@ -1505,6 +1510,33 @@ scenario_unit_lookup_never_targets_the_session_manager() {
         "an unreadable cgroup yields no unit"
 }
 
+scenario_unit_restart_without_a_daemon_is_a_failure() {
+    # Type=oneshot ExecStart exits 0 once it has spawned the app-server, so a
+    # green restart says nothing about whether the daemon came up. Reporting
+    # success here is what leaves the box with no app-server and no later tick
+    # willing to repair it.
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    set_appserver_unit codex-remote-control.service 0 vanish
+    CODEX_APPSERVER_WAIT_SECS=0
+
+    run_rotate
+
+    assert_exit 0 "$RC" "absent daemon after restart exit"
+    assert_active acctB "absent daemon after restart still performed the swap"
+    assert_contains "$OUT" "app-server did NOT come back" \
+        "a restart that left no daemon reported itself as a failure"
+    assert_eq "" "$(replaced_how)" \
+        "a restart that left no daemon is not recorded as a replacement"
+}
+
 scenario_session_manager_override_is_refused() {
     # An operator override must not be a way around the exclusion. Naming the
     # session manager here would tear down every user service on the box.
@@ -1810,6 +1842,7 @@ run_scenario "Rolled back swap leaves the app-server alone"      scenario_rolled
 run_scenario "App-server restart can be disabled"                scenario_appserver_restart_can_be_disabled
 run_scenario "Unit owned app-server restarts its unit"          scenario_unit_owned_appserver_restarts_the_unit
 run_scenario "Unit restart failure falls back to the signal"    scenario_unit_restart_failure_falls_back_to_the_signal
+run_scenario "Unit restart without a daemon is a failure"      scenario_unit_restart_without_a_daemon_is_a_failure
 run_scenario "Session manager override is refused"             scenario_session_manager_override_is_refused
 run_scenario "Unit lookup never targets the session manager"    scenario_unit_lookup_never_targets_the_session_manager
 run_scenario "Status never kills the app-server"                 scenario_status_never_kills_appserver

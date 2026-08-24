@@ -358,6 +358,19 @@ codex_restartable_unit() {
     printf '%s' "$1"
 }
 
+# Wait briefly for an app-server to be listening again, 1 if none turns up.
+# The daemon is spawned detached, so it is up a moment after the unit reports
+# started, not at the instant it does.
+codex_await_appserver() {
+    local waited=0 limit="${CODEX_APPSERVER_WAIT_SECS:-15}"
+    while :; do
+        [ -z "$(codex_appserver_pid)" ] || return 0
+        [ "$waited" -lt "$limit" ] || return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
 # Record for the tests, which cannot observe a signal or a systemctl call.
 codex_appserver_record() {
     [ -n "${CODEX_APPSERVER_MOCK_DIR:-}" ] || return 0
@@ -389,6 +402,14 @@ codex_kill_appserver() {
         "${CODEX_SYSTEMCTL:-systemctl}" --user kill --signal=KILL "$unit" >/dev/null 2>&1
         if "${CODEX_SYSTEMCTL:-systemctl}" --user restart "$unit" >/dev/null 2>&1; then
             CODEX_APPSERVER_METHOD="unit:$unit"
+            # A restart that reports success is not proof of a running daemon.
+            # This unit is Type=oneshot: ExecStart exits 0 once it has spawned the
+            # app-server and systemd reports active either way. Taking that at its
+            # word is how the box ends up with no app-server at all, and nothing
+            # repairs it later, because a tick that finds no listening pid
+            # concludes there is nothing to restart and returns 2. So confirm a
+            # daemon is actually listening again before calling this a success.
+            codex_await_appserver || return 1
             codex_appserver_record "$pid" "$CODEX_APPSERVER_METHOD" || return 1
             return 0
         fi
