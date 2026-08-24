@@ -321,7 +321,7 @@ codex_appserver_pid() {
 codex_appserver_unit() {
     local pid=$1 unit
     if [ -n "${CODEX_APPSERVER_UNIT+x}" ]; then
-        printf '%s' "$CODEX_APPSERVER_UNIT"
+        codex_restartable_unit "$CODEX_APPSERVER_UNIT"
         return 0
     fi
     # Never read the real cgroup tree from the test sandbox. A mock pid is an
@@ -342,13 +342,20 @@ codex_unit_from_cgroup() {
     unit=$(printf '%s\n' "$1" \
         | sed -n 's#^.*/\([A-Za-z0-9@:_.-]*\.service\)$#\1#p' \
         | head -1)
-    # user@N.service is the per-user session manager, not the app-server's own
-    # unit. Restarting it would tear down every user service on the box, this
-    # rotator's own timer included, to swap one token.
-    case "$unit" in
+    codex_restartable_unit "$unit"
+}
+
+# The unit if it is safe to restart, empty otherwise. user@N.service is the
+# per-user session manager, not the app-server's own unit: restarting it would
+# tear down every user service on the box, this rotator's own timer included, to
+# swap one token. Every route to a unit name goes through here, an explicit
+# CODEX_APPSERVER_UNIT included, because an override that could still name it
+# would just be the same accident with an extra step.
+codex_restartable_unit() {
+    case "$1" in
         ""|user@*.service) return 0 ;;
     esac
-    printf '%s' "$unit"
+    printf '%s' "$1"
 }
 
 # Record for the tests, which cannot observe a signal or a systemctl call.

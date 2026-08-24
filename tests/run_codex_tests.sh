@@ -1505,6 +1505,30 @@ scenario_unit_lookup_never_targets_the_session_manager() {
         "an unreadable cgroup yields no unit"
 }
 
+scenario_session_manager_override_is_refused() {
+    # An operator override must not be a way around the exclusion. Naming the
+    # session manager here would tear down every user service on the box.
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    set_appserver_unit user@1000.service
+
+    run_rotate
+
+    assert_exit 0 "$RC" "session manager override exit"
+    assert_active acctB "session manager override still performed the swap"
+    assert_eq "" "$(systemctl_calls)" \
+        "the session manager is never handed to systemctl, even as an override"
+    assert_eq "4242 signal" "$(replaced_how)" \
+        "a refused unit override replaces the process by signal instead"
+}
+
 scenario_status_never_kills_appserver() {
     make_config "acctA acctB"
     seed_account acctA "accessA" "accountA"
@@ -1786,6 +1810,7 @@ run_scenario "Rolled back swap leaves the app-server alone"      scenario_rolled
 run_scenario "App-server restart can be disabled"                scenario_appserver_restart_can_be_disabled
 run_scenario "Unit owned app-server restarts its unit"          scenario_unit_owned_appserver_restarts_the_unit
 run_scenario "Unit restart failure falls back to the signal"    scenario_unit_restart_failure_falls_back_to_the_signal
+run_scenario "Session manager override is refused"             scenario_session_manager_override_is_refused
 run_scenario "Unit lookup never targets the session manager"    scenario_unit_lookup_never_targets_the_session_manager
 run_scenario "Status never kills the app-server"                 scenario_status_never_kills_appserver
 run_scenario "In-flight work blocks the swap"                    scenario_inflight_work_blocks_swap

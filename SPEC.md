@@ -362,7 +362,10 @@ provider credentials. See `README.md` for operator setup.
   - A unit that fails to restart falls back to the signal, because a unit that will
     not restart still leaves the daemon serving the account the swap moved away from.
   - `user@N.service` is never a restart target. It is the per-user session manager,
-    and restarting it would tear down every user service on the box.
+    and restarting it would tear down every user service on the box. This holds for an
+    explicit `CODEX_APPSERVER_UNIT` too: an override that could still name it would
+    just be the same accident with an extra step. A refused unit falls back to the
+    signal.
 10. Killing the app-server interrupts every running turn, so no swap fires while
   Codex work is in flight. `CODEX_INFLIGHT_CMD` is the probe: non-empty stdout means
   work is in flight. Unset uses the bundled `codex-inflight.sh`. An empty value
