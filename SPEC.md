@@ -376,6 +376,30 @@ provider credentials. See `README.md` for operator setup.
     explicit `CODEX_APPSERVER_UNIT` too: an override that could still name it would
     just be the same accident with an extra step. A refused unit falls back to the
     signal.
+9b. Replacing by signal leaves the respawn to an external supervisor, which is
+  silent when that supervisor is gone. A live tick that finds nothing listening on
+  the socket therefore restarts `CODEX_APPSERVER_BACKSTOP_UNIT` to bring an
+  app-server back, and reports it when the unit produces none. Empty disables the
+  backstop and is the default; `user@N.service` is refused here too. The tick that
+  did the replacing skips this, because its own signal has just handed the respawn
+  to the supervisor and starting a unit in the same breath would race it for the
+  socket. `status` never runs it, being a dry read.
+
+9c. Only a confirmed absence starts the backstop unit. `codex_appserver_pid`
+  separates "nothing is listening", empty output with exit 0, from "the question
+  could not be asked", a non-zero exit, and the backstop holds on the latter. The
+  question counts as unanswerable when `ss` itself fails and, just as importantly,
+  when it lists the socket without a `pid=`: a listening socket nobody could
+  attribute is something running, not nothing running. The same non-zero reaches
+  `codex-inflight.sh`, which reports it as in flight so no swap fires on it. Reading an unanswerable probe as an absence would replace a live
+  app-server on every tick, with no in-flight gate in front of it. Once absence is
+  confirmed there are no turns to interrupt, so no in-flight probe is needed.
+
+9d. The backstop runs on every live exit path, not only a tick that reached the
+  end. A tick that bailed at a guard, no active pointer, pointer desync, a failed
+  sync out, is still a tick that noticed the box has no app-server, and those are
+  the paths a stranded box repeats.
+
 10. Killing the app-server interrupts every running turn, so no swap fires while
   Codex work is in flight. `CODEX_INFLIGHT_CMD` is the probe: non-empty stdout means
   work is in flight. Unset uses the bundled `codex-inflight.sh`. An empty value

@@ -394,7 +394,9 @@ Common cases:
   kill it with nothing left to bring it back. Check with
   `systemctl --user status codex-remote-control.service`, and note that a `Type=oneshot`
   unit reports `active (exited)` even when its daemon is gone; confirm against
-  `pgrep -af "app-server --remote-control"`. Restarting that unit is the recovery.
+  `pgrep -af "app-server --remote-control"`. Restarting that unit is the recovery, and
+  setting `CODEX_APPSERVER_BACKSTOP_UNIT` to it makes a later tick do that recovery
+  for you instead of leaving the box stranded until someone notices.
 
 ## Uninstall
 

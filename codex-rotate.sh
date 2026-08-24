@@ -17,9 +17,32 @@ if [ "$DRY" -eq 0 ] && [ ! -f "$CODEX_ROTATOR_STORE/ENABLED" ]; then
     exit 0
 fi
 
+APPSERVER_REPLACED=0
+
+# Runs on every live exit, not just the bottom of the script. A tick that bailed
+# at one of the guards below (no active pointer, pointer desync, a failed sync
+# out) is still a tick that noticed the box has no app-server, and leaving those
+# paths out would keep the outage open for exactly the reasons that make it hard
+# to spot. Skipped on a tick that replaced the process itself: that tick's signal
+# has just handed the respawn to Codex Desktop, and starting a unit in the same
+# breath would race it for the socket, so Desktop gets until the next tick.
+# shellcheck disable=SC2317  # invoked through the EXIT trap installed below
+codex_backstop_on_exit() {
+    [ "$APPSERVER_REPLACED" -eq 0 ] || return 0
+    [ "$CODEX_APPSERVER_RESTART" = "1" ] || return 0
+    codex_ensure_appserver
+    case $? in
+        0) codex_log "no app-server was running; started one via $CODEX_APPSERVER_BACKSTOP_UNIT_USED" ;;
+        1) codex_log "no app-server was running and $CODEX_APPSERVER_BACKSTOP_UNIT_USED produced none; no Codex work can run until one is up" ;;
+    esac
+}
+
 if [ "$DRY" -eq 0 ]; then
     codex_prepare_store || exit 0
     codex_take_rotate_lock || exit 0
+    # Installed only here, so status stays a dry read and a disabled tick, which
+    # has already exited above, never reaches it.
+    trap codex_backstop_on_exit EXIT
 fi
 
 if [ ! -f "$CODEX_ROTATOR_STORE/active" ]; then
@@ -353,6 +376,7 @@ if [ "$SHOULD_SWAP" -eq 1 ]; then
                 codex_kill_appserver
                 case $? in
                     0)
+                        APPSERVER_REPLACED=1
                         case "$CODEX_APPSERVER_METHOD" in
                             unit:*)
                                 codex_log "app-server restarted via ${CODEX_APPSERVER_METHOD#unit:} to pick up $target" ;;
