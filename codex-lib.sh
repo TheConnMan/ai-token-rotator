@@ -305,14 +305,20 @@ codex_write_usage() {
 # unit in that case. Only fall back to the signal when no unit owns the process,
 # which is the older arrangement where Codex Desktop respawns it on its next SSH
 # connect. It ignores SIGTERM, hence SIGKILL.
+# Empty output with exit 0 means nothing is listening, which is a real answer.
+# Exit 1 means the question could not be asked, which is not the same thing and
+# must never be read as absence: acting on it would replace a live app-server.
 codex_appserver_pid() {
+    local listeners
     if [ -n "${CODEX_APPSERVER_MOCK_DIR:-}" ]; then
+        [ ! -e "$CODEX_APPSERVER_MOCK_DIR/probe-fails" ] || return 1
         [ -s "$CODEX_APPSERVER_MOCK_DIR/pid" ] || return 0
         cat "$CODEX_APPSERVER_MOCK_DIR/pid"
         return 0
     fi
     [ -n "$CODEX_APPSERVER_SOCKET" ] || return 0
-    ss -xlp 2>/dev/null | awk -v sock="$CODEX_APPSERVER_SOCKET" '
+    listeners=$(ss -xlp 2>/dev/null) || return 1
+    printf '%s\n' "$listeners" | awk -v sock="$CODEX_APPSERVER_SOCKET" '
         index($0, sock) > 0 && match($0, /pid=[0-9]+/) {
             print substr($0, RSTART + 4, RLENGTH - 4)
             exit
@@ -385,11 +391,17 @@ codex_await_appserver() {
 # in the log, the same way CODEX_APPSERVER_METHOD is.
 # shellcheck disable=SC2034
 codex_ensure_appserver() {
-    local unit
+    local unit pid
     CODEX_APPSERVER_BACKSTOP_UNIT_USED=""
     unit=$(codex_restartable_unit "$CODEX_APPSERVER_BACKSTOP_UNIT")
     [ -n "$unit" ] || return 2
-    [ -z "$(codex_appserver_pid)" ] || return 2
+    # Only a confirmed absence justifies this. A probe that could not answer is
+    # not an absent app-server, and restarting on a reading we never took would
+    # kill whatever turns are running, on every tick, with no in-flight gate in
+    # front of it. Once absence is confirmed there are no turns to interrupt,
+    # which is why no in-flight probe is needed here.
+    pid=$(codex_appserver_pid) || return 2
+    [ -z "$pid" ] || return 2
     CODEX_APPSERVER_BACKSTOP_UNIT_USED="$unit"
     # restart, not start. The unit keeps reporting active through
     # RemainAfterExit with no daemon behind it, so start is a no-op on exactly

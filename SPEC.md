@@ -385,6 +385,18 @@ provider credentials. See `README.md` for operator setup.
   to the supervisor and starting a unit in the same breath would race it for the
   socket. `status` never runs it, being a dry read.
 
+9c. Only a confirmed absence starts the backstop unit. `codex_appserver_pid`
+  separates "nothing is listening", which is empty output with exit 0, from "the
+  question could not be asked", which is exit 1, and the backstop holds on the
+  latter. Reading an unanswerable probe as an absence would replace a live
+  app-server on every tick, with no in-flight gate in front of it. Once absence is
+  confirmed there are no turns to interrupt, so no in-flight probe is needed.
+
+9d. The backstop runs on every live exit path, not only a tick that reached the
+  end. A tick that bailed at a guard, no active pointer, pointer desync, a failed
+  sync out, is still a tick that noticed the box has no app-server, and those are
+  the paths a stranded box repeats.
+
 10. Killing the app-server interrupts every running turn, so no swap fires while
   Codex work is in flight. `CODEX_INFLIGHT_CMD` is the probe: non-empty stdout means
   work is in flight. Unset uses the bundled `codex-inflight.sh`. An empty value

@@ -192,6 +192,9 @@ setup_sandbox() {
 # absent no app-server is running. Every kill the rotator performs appends to
 # "$APPSERVER/killed" instead of signalling a real process.
 set_appserver_pid() { printf '%s' "$1" > "$APPSERVER/pid"; }
+# Makes the pid lookup unanswerable, standing in for an ss that cannot run or
+# cannot attribute the listening socket. Distinct from no pid at all.
+fail_appserver_probe() { : > "$APPSERVER/probe-fails"; }
 killed_pids() { cat "$APPSERVER/killed" 2>/dev/null; }
 replaced_how() { cat "$APPSERVER/replaced" 2>/dev/null; }
 systemctl_calls() { cat "$APPSERVER/systemctl" 2>/dev/null; }
@@ -1748,6 +1751,75 @@ scenario_backstop_is_off_by_default() {
     assert_not_contains "$OUT" "started one via" "an unconfigured backstop stays silent"
 }
 
+scenario_backstop_holds_when_the_probe_cannot_answer() {
+    # An unanswerable probe is not an absent app-server. Treating it as one would
+    # kill whatever turns are running, on every tick, with no in-flight gate in
+    # front of it.
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_unit codex-remote-control.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+    fail_appserver_probe
+
+    run_rotate
+
+    assert_exit 0 "$RC" "unanswerable probe exit"
+    assert_eq "" "$(systemctl_calls)" \
+        "an unanswerable probe never restarts the backstop unit"
+    assert_not_contains "$OUT" "started one via" \
+        "an unanswerable probe is not reported as an absent app-server"
+}
+
+scenario_backstop_runs_on_an_early_exit_tick() {
+    # A tick that bailed at a guard is still a tick that noticed the box has no
+    # app-server. These are the paths a stranded box hits over and over.
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_unit codex-remote-control.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+    # No active pointer, so the tick bails long before the swap logic.
+    rm -f "$STORE/active"
+
+    run_rotate
+
+    assert_exit 0 "$RC" "early exit backstop exit"
+    assert_contains "$OUT" "no active Codex account set" "the tick did bail early"
+    assert_contains "$OUT" "started one via codex-remote-control.service" \
+        "a tick that bailed early still healed the absent app-server"
+}
+
+scenario_status_never_runs_the_backstop() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_unit codex-remote-control.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+
+    run_rotate status
+
+    assert_exit 0 "$RC" "status backstop exit"
+    assert_eq "" "$(systemctl_calls)" "status must never start the backstop unit"
+}
+
 scenario_status_never_kills_appserver() {
     make_config "acctA acctB"
     seed_account acctA "accessA" "accountA"
@@ -2040,6 +2112,9 @@ run_scenario "Backstop skips the tick that replaced it"        scenario_backstop
 run_scenario "Backstop refuses the session manager"            scenario_backstop_refuses_the_session_manager
 run_scenario "Backstop reports a unit that produced nothing"   scenario_backstop_reports_a_unit_that_produced_nothing
 run_scenario "Backstop is off by default"                      scenario_backstop_is_off_by_default
+run_scenario "Backstop holds when the probe cannot answer"     scenario_backstop_holds_when_the_probe_cannot_answer
+run_scenario "Backstop runs on an early exit tick"             scenario_backstop_runs_on_an_early_exit_tick
+run_scenario "Status never runs the backstop"                  scenario_status_never_runs_the_backstop
 run_scenario "Status never kills the app-server"                 scenario_status_never_kills_appserver
 run_scenario "In-flight work blocks the swap"                    scenario_inflight_work_blocks_swap
 run_scenario "Unknown in-flight state blocks the swap"           scenario_inflight_probe_failure_holds
