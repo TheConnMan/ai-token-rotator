@@ -382,7 +382,7 @@ codex_appserver_record() {
 # Sets CODEX_APPSERVER_METHOD to the lever used, so the caller can log honestly
 # about whether the daemon is already back or is waiting on an external respawn.
 codex_kill_appserver() {
-    local pid unit
+    local pid unit dropped=0
     CODEX_APPSERVER_METHOD=""
     pid=$(codex_appserver_pid) || return 1
     [ -n "$pid" ] || return 2
@@ -399,7 +399,8 @@ codex_kill_appserver() {
         # the cgroup also takes out the supervisor that would otherwise hold the
         # killed daemon as an unreaped zombie, which is what the stop was stuck
         # waiting on.
-        "${CODEX_SYSTEMCTL:-systemctl}" --user kill --signal=KILL "$unit" >/dev/null 2>&1
+        "${CODEX_SYSTEMCTL:-systemctl}" --user kill --signal=KILL "$unit" >/dev/null 2>&1 \
+            && dropped=1
         if "${CODEX_SYSTEMCTL:-systemctl}" --user restart "$unit" >/dev/null 2>&1; then
             CODEX_APPSERVER_METHOD="unit:$unit"
             # A restart that reports success is not proof of a running daemon.
@@ -413,8 +414,16 @@ codex_kill_appserver() {
             codex_appserver_record "$pid" "$CODEX_APPSERVER_METHOD" || return 1
             return 0
         fi
-        # A unit that refuses to restart still leaves the daemon serving the
-        # stale account, so fall through to the signal rather than give up.
+        # The restart failed. If the kill above landed, the daemon is already
+        # gone: there is nothing left to signal, and falling through would
+        # report that Codex work carries on using the old account when in fact
+        # nothing is running at all. Keep the unit failure, which says that.
+        if [ "$dropped" = 1 ]; then
+            CODEX_APPSERVER_METHOD="unit:$unit"
+            return 1
+        fi
+        # The unit would neither kill nor restart, so the daemon may well still
+        # be up and serving the stale account. The signal is still worth trying.
     fi
 
     CODEX_APPSERVER_METHOD="signal"

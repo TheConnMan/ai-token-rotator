@@ -359,8 +359,10 @@ provider credentials. See `README.md` for operator setup.
     an unreaped zombie, which is what that stop was waiting on.
   - Nothing owns it: SIGKILL, and it respawns on the next Codex Desktop connect and
     reads the new account then. The process ignores SIGTERM, so the kill is SIGKILL.
-  - A unit that fails to restart falls back to the signal, because a unit that will
-    not restart still leaves the daemon serving the account the swap moved away from.
+  - A unit that fails to restart falls back to the signal only when the kill did not
+    land, because then the daemon may still be up serving the account the swap moved
+    away from. When the kill did land there is nothing left to signal, and the tick
+    reports the outage instead of claiming the old account is still in use.
   - A restart that reports success is not proof of a running daemon. A `Type=oneshot`
     `ExecStart` exits 0 once it has spawned the app-server, and systemd reports
     `active` either way, so the rotator waits up to `CODEX_APPSERVER_WAIT_SECS` (15)

@@ -201,11 +201,12 @@ systemctl_calls() { cat "$APPSERVER/systemctl" 2>/dev/null; }
 # A third argument of "vanish" makes the stub clear the mocked pid, standing in
 # for a unit whose ExecStart exits 0 without the detached daemon ever coming up.
 set_appserver_unit() {
-    local unit="$1" rc="${2:-0}" vanish="${3:-}"
+    local unit="$1" rc="${2:-0}" vanish="${3:-}" killrc="${4:-${2:-0}}"
     cat > "$SB/systemctl.sh" <<EOF
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" >> "$APPSERVER/systemctl"
 [ "$vanish" = vanish ] && [ "\$2" = restart ] && : > "$APPSERVER/pid"
+[ "\$2" = kill ] && exit $killrc
 exit $rc
 EOF
     chmod 700 "$SB/systemctl.sh"
@@ -1537,6 +1538,31 @@ scenario_unit_restart_without_a_daemon_is_a_failure() {
         "a restart that left no daemon is not recorded as a replacement"
 }
 
+scenario_dropped_unit_that_will_not_restart_never_signals() {
+    # Once the unit kill has landed the daemon is gone, so there is nothing left
+    # for the signal fallback to do, and claiming Codex work carries on using the
+    # old account would be the opposite of what is happening.
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 70
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_pid 4242
+    set_appserver_unit codex-remote-control.service 1 "" 0
+
+    run_rotate
+
+    assert_exit 0 "$RC" "dropped unit restart failure exit"
+    assert_active acctB "dropped unit restart failure still performed the swap"
+    assert_eq "" "$(killed_pids)" \
+        "a daemon already dropped with its unit is not signalled again"
+    assert_contains "$OUT" "app-server did NOT come back" \
+        "a dropped unit that will not restart reported the real outage"
+}
+
 scenario_session_manager_override_is_refused() {
     # An operator override must not be a way around the exclusion. Naming the
     # session manager here would tear down every user service on the box.
@@ -1843,6 +1869,7 @@ run_scenario "App-server restart can be disabled"                scenario_appser
 run_scenario "Unit owned app-server restarts its unit"          scenario_unit_owned_appserver_restarts_the_unit
 run_scenario "Unit restart failure falls back to the signal"    scenario_unit_restart_failure_falls_back_to_the_signal
 run_scenario "Unit restart without a daemon is a failure"      scenario_unit_restart_without_a_daemon_is_a_failure
+run_scenario "Dropped unit that will not restart never signals" scenario_dropped_unit_that_will_not_restart_never_signals
 run_scenario "Session manager override is refused"             scenario_session_manager_override_is_refused
 run_scenario "Unit lookup never targets the session manager"    scenario_unit_lookup_never_targets_the_session_manager
 run_scenario "Status never kills the app-server"                 scenario_status_never_kills_appserver
