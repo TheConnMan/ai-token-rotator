@@ -29,7 +29,7 @@ CODEX_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # disables the gate. Use +x, not :=, because := treats empty as unset and
 # would launch the real probe from the test suite.
 if [ -z "${CODEX_INFLIGHT_CMD+x}" ]; then
-    CODEX_INFLIGHT_CMD="$CODEX_LIB_DIR/codex-inflight.sh"
+    CODEX_INFLIGHT_CMD="$CODEX_LIB_DIR/codex-inflight-all.sh"
 fi
 
 # Only weekly_ceil, weekly_dead_zone, and the numeric helpers are reused from

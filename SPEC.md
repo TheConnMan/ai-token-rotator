@@ -215,6 +215,13 @@ Token-only helpers (all atomic: temp in the destination dir + chmod 600 + `mv -f
   unsafe store skips the tick without writing credentials (log if possible,
   else exit 0). Bootstrap exits 1 on an unsafe store.
 - Read-modify-write over the live cred, NOT a symlink.
+- Never swap while Claude work is in flight. Swapping the live credential under a
+  running session redirects its next API call to another account: at best the run is
+  billed to the wrong weekly allowance and any dispatcher's own accounting is wrong, at
+  worst the call fails and the job dies. `INFLIGHT_CMD` is the probe, with the same
+  contract as `CODEX_INFLIGHT_CMD`: non-empty stdout means in flight, a non-zero exit is
+  UNKNOWN and counts as in flight, an empty value disables the gate, and unset uses the
+  bundled `drain-inflight.sh claude`. The gate covers PIN forced swaps too.
 - N=1 => monitored no-op. Target must never equal ACTIVE.
 - Config thresholds honored; utilization scale 0-100.
 - Real tokens never committed; real `config.env` and the store are gitignored.
@@ -406,11 +413,16 @@ provider credentials. See `README.md` for operator setup.
   disables the gate. A probe that exits non-zero is UNKNOWN and counts as in
   flight, because an unanswerable probe is never a licence to kill a job. The
   gate covers PIN forced swaps too.
-10a. `codex-inflight.sh` is that probe. It asks the app-server itself, via
-  `thread/list`, which threads are running. The app-server is the only component that
-  sees every turn, so one probe covers Codex Desktop, the CLI, and any external
-  dispatcher without any of them registering work anywhere. This matters most for
-  dispatchers that keep no record the rotator could otherwise read.
+10a. `codex-inflight-all.sh` is that probe, and it is the union of two signals.
+  `codex-inflight.sh` asks the app-server itself, via `thread/list`, which threads are
+  running; the app-server sees every turn it is running, so that one probe covers Codex
+  Desktop, the CLI, and any external dispatcher without any of them registering work
+  anywhere. It cannot see work a dispatcher launched outside that daemon, so
+  `drain-inflight.sh codex` adds the dispatcher's own record of jobs it dispatched and
+  has not yet seen finish. Either probe reporting work holds the swap, and either probe
+  reporting UNKNOWN makes the union UNKNOWN: one blind signal is enough to make
+  "nothing is running" an unsupported claim. The app-server arm is the primary and must
+  never be dropped in favour of the dispatcher arm alone.
   A thread counts as quiet only when its status is `idle` or `notLoaded`; every other
   status, known or not, holds the swap. Matching the quiet set rather than matching
   `active` is deliberate: an unrecognised status must hold rather than authorise a

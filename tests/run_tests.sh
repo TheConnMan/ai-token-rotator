@@ -172,6 +172,8 @@ EOF
 setup_sandbox() {
     SB=$(mktemp -d "$TEST_ROOT/sb.XXXXXX")
     guard_tmp "$SB"
+    # A probe configured by one scenario must not leak into the next.
+    unset INFLIGHT_CMD
     STORE="$SB/store"
     CRED="$SB/cred/.credentials.json"   # NOT $HOME/.claude/.credentials.json
     CONFIG="$SB/config.env"
@@ -197,8 +199,24 @@ run_rotate() {
     ROTATOR_USAGE_MOCK_DIR="$MOCK" \
     ROTATOR_REFRESH_MOCK_DIR="$REFRESH" \
     ROTATOR_MIRROR_FILE="$MIRROR_FILE" \
+    INFLIGHT_CMD="${INFLIGHT_CMD:-}" \
         bash "$ROTATE" "$@"
     RC=$?
+}
+
+# set_inflight <stdout> [exit-code] - opt this scenario into the in-flight gate with a
+# stub probe. Unset INFLIGHT_CMD would resolve to the bundled drain probe, which asks
+# this box's live bonus-drain; every tick helper defaults it to empty so no scenario
+# reaches outside its sandbox by accident.
+set_inflight() {
+    local out="$1" rc="${2:-0}"
+    cat > "$SB/inflight.sh" <<EOF
+#!/usr/bin/env bash
+printf '%s' "$out"
+exit $rc
+EOF
+    chmod 700 "$SB/inflight.sh"
+    INFLIGHT_CMD="$SB/inflight.sh"
 }
 
 run_rotate_status_out() {
@@ -209,6 +227,7 @@ run_rotate_status_out() {
         ROTATOR_USAGE_MOCK_DIR="$MOCK" \
         ROTATOR_REFRESH_MOCK_DIR="$REFRESH" \
         ROTATOR_MIRROR_FILE="$MIRROR_FILE" \
+        INFLIGHT_CMD="${INFLIGHT_CMD:-}" \
             bash "$ROTATE" status
     )
     RC=$?
@@ -1852,6 +1871,147 @@ scenario_ceiling_default_applies_to_unnamed_account() {
     run_rotate
     assert_eq "acctB" "$(active_label)" "ceiling-default swapped off the account at the default ceiling"
 }
+
+# --- in-flight gate -----------------------------------------------------------
+# Swapping the live credential under a running session redirects its next API call to
+# another account: the run is billed to the wrong weekly allowance, and the drain's own
+# accounting silently disagrees with reality. These mirror the Codex gate scenarios.
+
+scenario_inflight_work_blocks_swap() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    # Weekly spread 70-10=60 >= 20, so trigger B would swap to acctB without the gate.
+    make_mock "$MOCK" "tok-acctA" 10 70
+    make_mock "$MOCK" "tok-acctB" 10 10
+    set_inflight "curie-2332 account=claude-business age=90s"
+
+    run_rotate
+    assert_exit 0 "$RC" "in-flight gate exits 0"
+    assert_eq "acctA" "$(active_label)" "in-flight work blocked the swap"
+    assert_cred_token "$CRED" "tok-acctA" "in-flight work left the live cred untouched"
+}
+
+scenario_inflight_probe_failure_holds() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 70
+    make_mock "$MOCK" "tok-acctB" 10 10
+    # A probe that cannot answer is unknown, and unknown is never a licence to swap.
+    set_inflight "" 1
+
+    run_rotate
+    assert_exit 0 "$RC" "in-flight probe failure exits 0"
+    assert_eq "acctA" "$(active_label)" "unknown in-flight state blocked the swap"
+    assert_cred_token "$CRED" "tok-acctA" "unknown in-flight state left the live cred untouched"
+}
+
+scenario_quiet_inflight_probe_allows_swap() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 70
+    make_mock "$MOCK" "tok-acctB" 10 10
+    set_inflight ""
+
+    run_rotate
+    assert_exit 0 "$RC" "quiet in-flight probe exits 0"
+    assert_eq "acctB" "$(active_label)" "quiet in-flight probe allowed the swap"
+    assert_cred_token "$CRED" "tok-acctB" "quiet in-flight probe swapped the live cred"
+}
+
+scenario_inflight_work_blocks_pinned_swap() {
+    make_config "$CONFIG" "acctA acctB"
+    seed_account acctA "tok-acctA"
+    seed_account acctB "tok-acctB"
+    set_active acctA
+    enable
+    make_cred "$CRED" "tok-acctA"
+    make_mock "$MOCK" "tok-acctA" 10 10
+    make_mock "$MOCK" "tok-acctB" 10 10
+    set_pin acctB
+    set_inflight "curie-2332 account=claude-business age=90s"
+
+    run_rotate
+    assert_exit 0 "$RC" "pinned in-flight gate exits 0"
+    assert_eq "acctA" "$(active_label)" "in-flight work blocked a pinned swap"
+    assert_cred_token "$CRED" "tok-acctA" "pinned in-flight hold left the live cred untouched"
+}
+
+# --- drain-inflight.sh probe contract ------------------------------------------
+# stdout non-empty + exit 0 => in flight; empty + 0 => clear; non-zero => unknown.
+# The stub stands in for bonus-drain so the probe never queries a live dispatcher.
+
+# stub_bonus_drain <stdout> [exit-code]
+stub_bonus_drain() {
+    local out="$1" rc="${2:-0}"
+    cat > "$SB/bonus-drain" <<EOF
+#!/usr/bin/env bash
+cat <<'JSON'
+$out
+JSON
+exit $rc
+EOF
+    chmod 700 "$SB/bonus-drain"
+}
+
+run_drain_probe() {
+    OUT=$(BONUS_DRAIN_BIN="${1:-$SB/bonus-drain}" bash "$REPO_ROOT/drain-inflight.sh" claude 2>/dev/null)
+    RC=$?
+}
+
+scenario_drain_probe_reports_dispatched_runs() {
+    stub_bonus_drain '{"runs":[{"task":"curie-2332","account_id":"claude-business","age_seconds":90}]}'
+    run_drain_probe
+    assert_exit 0 "$RC" "drain probe exits 0 with work in flight"
+    assert_eq "curie-2332 account=claude-business age=90s" "$OUT" "drain probe named the in-flight run"
+}
+
+scenario_drain_probe_quiet_when_no_runs() {
+    stub_bonus_drain '{"runs":[]}'
+    run_drain_probe
+    assert_exit 0 "$RC" "drain probe exits 0 when nothing is in flight"
+    assert_eq "" "$OUT" "drain probe is silent when nothing is in flight"
+}
+
+scenario_drain_probe_unknown_when_dispatcher_fails() {
+    stub_bonus_drain '' 1
+    run_drain_probe
+    assert_exit 1 "$RC" "a dispatcher that cannot answer is unknown, not clear"
+}
+
+scenario_drain_probe_unknown_on_unparseable_reply() {
+    stub_bonus_drain 'not json at all'
+    run_drain_probe
+    assert_exit 1 "$RC" "an unparseable reply is unknown, not clear"
+}
+
+scenario_drain_probe_clear_without_a_dispatcher() {
+    # No bonus-drain on the box is a real answer: there is no drain work to protect.
+    run_drain_probe "$SB/absent-bonus-drain"
+    assert_exit 0 "$RC" "a box without bonus-drain is clear, not unknown"
+    assert_eq "" "$OUT" "a box without bonus-drain reports nothing in flight"
+}
+
+run_scenario "In-flight work blocks the swap"                   scenario_inflight_work_blocks_swap
+run_scenario "Unknown in-flight state blocks the swap"          scenario_inflight_probe_failure_holds
+run_scenario "Quiet in-flight probe allows the swap"            scenario_quiet_inflight_probe_allows_swap
+run_scenario "In-flight work blocks a pinned swap"              scenario_inflight_work_blocks_pinned_swap
+run_scenario "Drain probe reports dispatched runs"              scenario_drain_probe_reports_dispatched_runs
+run_scenario "Drain probe is quiet when nothing runs"           scenario_drain_probe_quiet_when_no_runs
+run_scenario "Drain probe is unknown when the dispatcher fails" scenario_drain_probe_unknown_when_dispatcher_fails
+run_scenario "Drain probe is unknown on an unparseable reply"   scenario_drain_probe_unknown_on_unparseable_reply
+run_scenario "Drain probe is clear without a dispatcher"        scenario_drain_probe_clear_without_a_dispatcher
 
 run_scenario "Ceiling: reserve swaps off a capped account"      scenario_ceiling_reserve_swaps_off_capped_account
 run_scenario "Ceiling: one point under the ceiling holds"       scenario_ceiling_below_ceiling_holds

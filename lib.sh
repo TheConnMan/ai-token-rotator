@@ -14,6 +14,32 @@ umask 077
 CRED="${ROTATOR_CRED:-$HOME/.claude/.credentials.json}"
 STORE="${ROTATOR_STORE:-$HOME/.claude/accounts}"
 
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Unset uses the bundled probe. Empty is the operator/test escape that disables
+# the gate. Use +x, not :=, because := treats empty as unset and would launch
+# the real probe from the test suite. Mirrors CODEX_INFLIGHT_CMD.
+if [ -z "${INFLIGHT_CMD+x}" ]; then
+    INFLIGHT_CMD="$LIB_DIR/drain-inflight.sh claude"
+fi
+
+# Is Claude work in flight right now?
+#   0 -> yes, hold        1 -> no, clear to swap        2 -> unknown, hold
+# Callers must treat 2 exactly like 0. Swapping the token under a running session
+# redirects its next API call to another account: at best the run is billed to the
+# wrong weekly allowance and the drain's own accounting is wrong, at worst the call
+# fails and the job dies. An unanswerable probe is never a licence to do that, in the
+# same way an unknown usage reading never fires a trigger.
+work_in_flight() {
+    local out rc
+    [ -n "$INFLIGHT_CMD" ] || return 1
+    # Deliberately unquoted so the configured value may carry arguments.
+    # shellcheck disable=SC2086
+    out=$($INFLIGHT_CMD 2>/dev/null)
+    rc=$?
+    [ "$rc" -ne 0 ] && return 2
+    [ -n "$out" ]
+}
+
 # prepare_store - refuse a symlink store, require owner == this uid, chmod 700
 # and verify that mode. Same shape as Codex codex_prepare_store. A leftover
 # 0755/0777 directory is not 0700: mkdir -m only applies when creating, so

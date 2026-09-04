@@ -296,6 +296,16 @@ printf 'sandbox-sibling-probe\n'
 exit 0
 EOF
     chmod 700 "$SB/libcopy/codex-inflight.sh"
+    # The default is the union probe, so it must be present to resolve and run.
+    # Both of its sub-probes are stubbed in the sandbox: the real drain probe
+    # would otherwise query this box's live bonus-drain, which would make the
+    # test environment-dependent and reach outside the sandbox.
+    cp "$REPO_ROOT/codex-inflight-all.sh" "$SB/libcopy/codex-inflight-all.sh"
+    cat > "$SB/libcopy/drain-inflight.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod 700 "$SB/libcopy/drain-inflight.sh" "$SB/libcopy/codex-inflight-all.sh"
 }
 
 # $1 is "unset" (default) or "empty". Prints the resolved CODEX_INFLIGHT_CMD.
@@ -1190,7 +1200,7 @@ EOF
         assert_contains "$(cat "$service")" "Description=Codex token rotator tick" "Codex service description"
         assert_contains "$(cat "$service")" "Type=oneshot" "Codex service type"
         assert_contains "$(cat "$service")" "ExecStart=$REPO_ROOT/codex-rotate.sh" "Codex service command"
-        assert_contains "$(cat "$service")" "Environment=CODEX_INFLIGHT_CMD=$REPO_ROOT/codex-inflight.sh" \
+        assert_contains "$(cat "$service")" "Environment=CODEX_INFLIGHT_CMD=$REPO_ROOT/codex-inflight-all.sh" \
             "Codex service in-flight probe"
     fi
     if [ ! -f "$timer" ]; then
@@ -1932,13 +1942,13 @@ scenario_unset_inflight_cmd_defaults_to_sibling_probe() {
     make_config "acctA"
     install_sandbox_codex_lib
     local resolved rc expected
-    expected="$(cd "$SB/libcopy" && pwd)/codex-inflight.sh"
+    expected="$(cd "$SB/libcopy" && pwd)/codex-inflight-all.sh"
     resolved=$(source_sandbox_codex_lib unset)
     assert_eq "$expected" "$resolved" \
-        "unset CODEX_INFLIGHT_CMD resolves to the sibling bundled probe"
+        "unset CODEX_INFLIGHT_CMD resolves to the sibling bundled union probe"
     sandbox_codex_work_in_flight unset
     rc=$?
-    assert_exit 0 "$rc" "unset CODEX_INFLIGHT_CMD invokes the sibling probe (in flight)"
+    assert_exit 0 "$rc" "unset CODEX_INFLIGHT_CMD invokes the sibling probes (in flight)"
 }
 
 scenario_empty_inflight_cmd_disables_the_gate() {
