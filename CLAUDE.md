@@ -105,10 +105,19 @@ Each of these exists because it broke something. Do not "simplify" one away.
   running turn, proven by a live mid-turn kill. `CODEX_INFLIGHT_CMD` gates it, and an
   unanswerable probe counts as in flight. Waiting one tick is cheap; killing a running
   job is not. The gate covers PIN forced swaps too.
-* **The in-flight probe asks the app-server, not a dispatcher's database.** Only the
-  app-server sees every running turn, so `codex-inflight.sh` covers every Codex client
-  on the box at once. A probe scoped to one dispatcher's own records would leave every
-  other dispatcher's jobs invisible and killable.
+* **The in-flight probe always asks the app-server; a dispatcher's record may only be
+  added to it.** Only the app-server sees every running turn, so `codex-inflight.sh`
+  covers every Codex client on the box at once, and a probe scoped to one dispatcher's
+  own records alone would leave every other dispatcher's jobs invisible and killable.
+  `codex-inflight-all.sh` therefore unions it with `drain-inflight.sh codex`, which
+  catches work launched outside the daemon that the app-server never saw. Adding an arm
+  is allowed; replacing the app-server arm is the regression this forbids.
+* **Never swap while Claude work is in flight.** Same gate, same contract, on the
+  Claude side: `INFLIGHT_CMD`, bundled default `drain-inflight.sh claude`, unknown
+  counts as in flight, and it covers PIN forced swaps. Swapping the credential under a
+  running session does not kill it outright the way an app-server restart does; it
+  redirects the session's next API call to another account, which bills the wrong
+  weekly allowance and silently falsifies any dispatcher's accounting.
 * **`idle` is quiet, and the quiet set is what gets matched.** A completed turn leaves
   its thread loaded as `idle`, not evicted. An early version reported anything that
   was not `notLoaded` as in flight, which held every swap forever once any job had

@@ -420,6 +420,22 @@ if [ "$SHOULD_SWAP" -eq 0 ]; then
     fi
 fi
 
+# Swapping the token moves the live credential out from under any session that is
+# mid-run, so no swap may fire while Claude work is in flight. An unanswerable probe
+# counts as in flight; the cost of waiting one tick is far below the cost of killing a
+# job or billing it to the wrong account. The gate covers PIN forced swaps too.
+if [ "$SHOULD_SWAP" -eq 1 ]; then
+    work_in_flight
+    inflight_rc=$?
+    if [ "$inflight_rc" -eq 0 ]; then
+        SHOULD_SWAP=0
+        reason="Claude work in flight; holding on $ACTIVE rather than swapping under it"
+    elif [ "$inflight_rc" -eq 2 ]; then
+        SHOULD_SWAP=0
+        reason="Claude in-flight probe failed, assuming work in flight; holding on $ACTIVE"
+    fi
+fi
+
 # Released pin: surface it in the log so the override is visible, and never as PINNED.
 if [ "$pin_released" -eq 1 ]; then
     reason="pin-released ($PIN_LABEL weekly=${WEEK[$PIN_LABEL]} >= ceiling ${CEIL[$PIN_LABEL]}); $reason"
