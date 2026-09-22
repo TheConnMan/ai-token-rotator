@@ -34,6 +34,7 @@ codex_backstop_on_exit() {
     case $? in
         0) codex_log "no app-server was running; started one via $CODEX_APPSERVER_BACKSTOP_UNIT_USED" ;;
         1) codex_log "no app-server was running and $CODEX_APPSERVER_BACKSTOP_UNIT_USED produced none; no Codex work can run until one is up" ;;
+        3) codex_log "no app-server found but Codex work is or may be in flight; holding the backstop" ;;
     esac
 }
 

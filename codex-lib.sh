@@ -309,7 +309,7 @@ codex_write_usage() {
 # Exit 1 means the question could not be asked, which is not the same thing and
 # must never be read as absence: acting on it would replace a live app-server.
 codex_appserver_pid() {
-    local listeners
+    local listeners resolved
     if [ -n "${CODEX_APPSERVER_MOCK_DIR:-}" ]; then
         [ ! -e "$CODEX_APPSERVER_MOCK_DIR/probe-fails" ] || return 1
         [ -s "$CODEX_APPSERVER_MOCK_DIR/pid" ] || return 0
@@ -318,17 +318,24 @@ codex_appserver_pid() {
     fi
     [ -n "$CODEX_APPSERVER_SOCKET" ] || return 0
     listeners=$(ss -xlp 2>/dev/null) || return 1
-    codex_pid_from_listeners "$listeners" "$CODEX_APPSERVER_SOCKET"
+    # ss names a listener by the path it was bound to, so a configured path that
+    # is a symlink (the control socket points into /tmp/codex-daemon-<uid>) never
+    # appears in its output. Matching only the configured path read a live
+    # app-server as absent, and the backstop killed it under running jobs on
+    # 2026-09-22. Match the resolved target as well.
+    resolved=$(readlink -f -- "$CODEX_APPSERVER_SOCKET" 2>/dev/null) || resolved=""
+    codex_pid_from_listeners "$listeners" "$CODEX_APPSERVER_SOCKET" "$resolved"
 }
 
-# The pid listening on a socket in an `ss -xlp` listing. Kept separate from the
+# The pid listening on a socket in an `ss -xlp` listing, matched on the
+# configured path or, when given, its resolved target. Kept separate from the
 # ss call so the three outcomes are exercised directly. Absent socket is empty
 # and 0; a matched socket yields its pid; a matched socket with no pid= is
 # something listening that could not be attributed, which is unknown, not
 # absence, so it fails rather than reporting nobody home.
 codex_pid_from_listeners() {
-    printf '%s\n' "$1" | awk -v sock="$2" '
-        index($0, sock) > 0 {
+    printf '%s\n' "$1" | awk -v sock="$2" -v alt="${3:-}" '
+        index($0, sock) > 0 || (alt != "" && index($0, alt) > 0) {
             seen = 1
             if (match($0, /pid=[0-9]+/)) {
                 print substr($0, RSTART + 4, RLENGTH - 4)
@@ -400,7 +407,8 @@ codex_await_appserver() {
 # keeps no app-server at all, and nothing repairs it, because a tick that finds
 # no listening pid concludes there is nothing to restart and returns 2. This is
 # that repair. Empty CODEX_APPSERVER_BACKSTOP_UNIT disables it.
-# 0 an app-server is listening again, 2 nothing to do, 1 the unit produced none.
+# 0 an app-server is listening again, 2 nothing to do, 1 the unit produced none,
+# 3 held because Codex work is, or may be, in flight.
 # CODEX_APPSERVER_BACKSTOP_UNIT_USED is read by codex-rotate.sh to name the unit
 # in the log, the same way CODEX_APPSERVER_METHOD is.
 # shellcheck disable=SC2034
@@ -411,11 +419,16 @@ codex_ensure_appserver() {
     [ -n "$unit" ] || return 2
     # Only a confirmed absence justifies this. A probe that could not answer is
     # not an absent app-server, and restarting on a reading we never took would
-    # kill whatever turns are running, on every tick, with no in-flight gate in
-    # front of it. Once absence is confirmed there are no turns to interrupt,
-    # which is why no in-flight probe is needed here.
+    # kill whatever turns are running, on every tick.
     pid=$(codex_appserver_pid) || return 2
     [ -z "$pid" ] || return 2
+    # A confirmed absence is still not enough on its own. The kill below takes
+    # every process in the unit's cgroup, jobs included, and an absence reading
+    # has been wrong before: a symlinked socket read as absent on 2026-09-22 and
+    # this path SIGKILLed running pytest jobs on a plain HOLD tick. So it takes
+    # the same in-flight gate as a swap, and an unanswerable probe holds it.
+    codex_work_in_flight
+    [ $? -eq 1 ] || return 3
     CODEX_APPSERVER_BACKSTOP_UNIT_USED="$unit"
     # restart, not start. The unit keeps reporting active through
     # RemainAfterExit with no daemon behind it, so start is a no-op on exactly
