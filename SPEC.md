@@ -399,8 +399,13 @@ provider credentials. See `README.md` for operator setup.
   when it lists the socket without a `pid=`: a listening socket nobody could
   attribute is something running, not nothing running. The same non-zero reaches
   `codex-inflight.sh`, which reports it as in flight so no swap fires on it. Reading an unanswerable probe as an absence would replace a live
-  app-server on every tick, with no in-flight gate in front of it. Once absence is
-  confirmed there are no turns to interrupt, so no in-flight probe is needed.
+  app-server on every tick. The listener is matched on the configured socket path
+  and on its resolved target, because `ss` names a symlinked socket by the path it
+  was bound to; matching the configured symlink alone read a live app-server as
+  absent on 2026-09-22. A confirmed absence is still not sufficient: the backstop
+  takes the same `CODEX_INFLIGHT_CMD` gate as a swap and restarts only on an
+  explicitly clear answer. Work in flight, or an unanswerable probe, holds it for
+  the tick, since the unit kill takes every process in its cgroup, jobs included.
 
 9d. The backstop runs on every live exit path, not only a tick that reached the
   end. A tick that bailed at a guard, no active pointer, pointer desync, a failed
