@@ -101,6 +101,10 @@ Each of these exists because it broke something. Do not "simplify" one away.
   did the replacing skips it, or it would race Desktop for the socket; the wait is one
   interval. Do not let a "nothing is running, so nothing to restart" branch come back:
   that reasoning is exactly what made the outage self-concealing.
+  The backstop is still gated like a swap: it restarts only when the in-flight probe
+  answers clear, and presence is matched on the socket's resolved target too. On
+  2026-09-22 a symlinked socket read as absent and the ungated backstop SIGKILLed
+  running jobs on a plain HOLD tick.
 * **Never swap while Codex work is in flight.** The restart above interrupts every
   running turn, proven by a live mid-turn kill. `CODEX_INFLIGHT_CMD` gates it, and an
   unanswerable probe counts as in flight. Waiting one tick is cheap; killing a running
