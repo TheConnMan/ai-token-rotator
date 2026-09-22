@@ -2094,6 +2094,162 @@ scenario_inflight_probe_is_clear_without_an_appserver() {
     assert_eq "" "$OUT" "no app-server means nothing can be in flight"
 }
 
+# --- the incident of 2026-09-22 -----------------------------------------------
+# The configured socket is a symlink into /tmp/codex-daemon-<uid>, and ss names
+# the listener by its resolved target. Matching only the configured path read a
+# live app-server as absent, so the in-flight probe reported the coast clear and
+# the EXIT backstop killed and restarted the unit under running jobs on a plain
+# HOLD or PINNED tick. These drive the real ss against a real listening socket;
+# only systemctl is stubbed.
+
+link_fake_appserver() {
+    mkdir -p "$SB/control"
+    ln -s "$FAKE_SOCK" "$SB/control/app-server-control.sock"
+    LINK_SOCK="$SB/control/app-server-control.sock"
+}
+
+# Like run_rotate, but with no app-server mock: presence comes from the real ss
+# and the in-flight answer from the real probe talking to the fake app-server.
+run_rotate_real_appserver() {
+    guard_tmp "$LINK_SOCK"
+    OUT=$(
+        CODEX_ROTATOR_AUTH="$AUTH" \
+        CODEX_ROTATOR_STORE="$STORE" \
+        ROTATOR_CONFIG="$CONFIG" \
+        CODEX_USAGE_MOCK_DIR="$MOCK" \
+        CODEX_REFRESH_MOCK_DIR="$REFRESH" \
+        CODEX_APPSERVER_SOCKET="$LINK_SOCK" \
+        CODEX_INFLIGHT_CMD="$INFLIGHT" \
+        CODEX_APPSERVER_UNIT="${CODEX_APPSERVER_UNIT:-}" \
+        CODEX_SYSTEMCTL="${CODEX_SYSTEMCTL:-/bin/false}" \
+        CODEX_APPSERVER_WAIT_SECS=0 \
+        CODEX_APPSERVER_BACKSTOP_UNIT="${CODEX_APPSERVER_BACKSTOP_UNIT:-}" \
+        CODEX_APPSERVER_RESTART=1 \
+        env -u CODEX_APPSERVER_MOCK_DIR bash "$ROTATE" "$@" 2>&1
+    )
+    RC=$?
+}
+
+scenario_symlinked_socket_is_present() {
+    make_config "acctA acctB"
+    start_fake_appserver idle
+    link_fake_appserver
+    local pid
+    pid=$(CODEX_APPSERVER_SOCKET="$LINK_SOCK" ROTATOR_CONFIG="$CONFIG" \
+        bash -c 'unset CODEX_APPSERVER_MOCK_DIR; source "$1" && codex_appserver_pid' _ "$CODEX_LIB")
+    local rc=$? want="$FAKE_PID"
+    stop_fake_appserver
+    assert_exit 0 "$rc" "symlinked socket lookup exit"
+    assert_eq "$want" "$pid" \
+        "a listener behind a symlinked socket is found, not read as absent"
+}
+
+scenario_inflight_probe_sees_work_through_symlink() {
+    make_config "acctA acctB"
+    start_fake_appserver active
+    link_fake_appserver
+    run_inflight "$LINK_SOCK"
+    stop_fake_appserver
+    assert_exit 0 "$RC" "symlinked probe exit"
+    assert_contains "$OUT" "thread-0" \
+        "work behind a symlinked socket is reported as in flight"
+}
+
+hold_tick_setup() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_unit codex-remote-control.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+    start_fake_appserver active
+    link_fake_appserver
+}
+
+scenario_hold_tick_leaves_symlinked_appserver_alone() {
+    hold_tick_setup
+    run_rotate_real_appserver
+    stop_fake_appserver
+    assert_exit 0 "$RC" "hold tick exit"
+    assert_contains "$OUT" "decision=HOLD" "the tick was a plain HOLD"
+    assert_eq "" "$(systemctl_calls)" \
+        "a HOLD tick never kills or restarts a live app-server running work"
+}
+
+scenario_pinned_tick_leaves_symlinked_appserver_alone() {
+    hold_tick_setup
+    set_pin acctA
+    run_rotate_real_appserver
+    stop_fake_appserver
+    assert_exit 0 "$RC" "pinned tick exit"
+    assert_contains "$OUT" "decision=PINNED" "the tick was PINNED"
+    assert_eq "" "$(systemctl_calls)" \
+        "a PINNED tick never kills or restarts a live app-server running work"
+}
+
+# Even a confirmed absence is not a licence on its own: the backstop takes the
+# same in-flight gate as the swap, and an unanswerable probe holds it.
+scenario_backstop_holds_while_work_is_in_flight() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_unit codex-remote-control.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+    set_inflight_cmd "job-1"
+    run_rotate
+    assert_exit 0 "$RC" "backstop in-flight exit"
+    assert_eq "" "$(systemctl_calls)" "in-flight work holds the backstop"
+    assert_contains "$OUT" "holding the backstop" "the hold is logged"
+}
+
+scenario_backstop_holds_when_inflight_is_unknown() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_unit codex-remote-control.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+    set_inflight_cmd "" 1
+    run_rotate
+    assert_exit 0 "$RC" "backstop unknown exit"
+    assert_eq "" "$(systemctl_calls)" "an unanswerable in-flight probe holds the backstop"
+}
+
+scenario_backstop_heals_when_inflight_is_clear() {
+    make_config "acctA acctB"
+    seed_account acctA "accessA" "accountA"
+    seed_account acctB "accessB" "accountB"
+    set_active acctA
+    enable_codex
+    make_auth "$AUTH" "accessA" "accountA" "A"
+    make_usage_mock "accessA" "accountA" 10 10
+    make_usage_mock "accessB" "accountB" 10 10
+    set_appserver_unit codex-remote-control.service 0 spawn
+    unset CODEX_APPSERVER_UNIT
+    CODEX_APPSERVER_BACKSTOP_UNIT=codex-remote-control.service
+    set_inflight_cmd "" 0
+    run_rotate
+    assert_exit 0 "$RC" "backstop clear exit"
+    assert_contains "$OUT" "started one via codex-remote-control.service" \
+        "a confirmed absence with a clear probe still heals"
+}
+
 run_scenario "Bootstrap captures only auth tokens"              scenario_bootstrap_captures_only_tokens
 run_scenario "Real fetch builds secure WHAM headers"            scenario_fetch_usage_builds_secure_headers
 run_scenario "Unauthorized WHAM response fails usage fetch"     scenario_fetch_usage_rejects_unauthorized_response
@@ -2165,6 +2321,14 @@ run_scenario "Probe holds on an unknown status"                  scenario_inflig
 run_scenario "Probe reports only the active thread"              scenario_inflight_probe_reports_only_the_active_thread
 run_scenario "Probe fails loudly on an RPC error"                scenario_inflight_probe_fails_loudly_on_rpc_error
 run_scenario "Probe is clear without an app-server"              scenario_inflight_probe_is_clear_without_an_appserver
+
+run_scenario "Symlinked socket listener is present"             scenario_symlinked_socket_is_present
+run_scenario "Probe sees work through a symlinked socket"       scenario_inflight_probe_sees_work_through_symlink
+run_scenario "HOLD tick leaves a symlinked app-server alone"    scenario_hold_tick_leaves_symlinked_appserver_alone
+run_scenario "PINNED tick leaves a symlinked app-server alone"  scenario_pinned_tick_leaves_symlinked_appserver_alone
+run_scenario "Backstop holds while work is in flight"           scenario_backstop_holds_while_work_is_in_flight
+run_scenario "Backstop holds when in-flight is unknown"         scenario_backstop_holds_when_inflight_is_unknown
+run_scenario "Backstop heals when in-flight is clear"           scenario_backstop_heals_when_inflight_is_clear
 
 printf '\nCodex summary: %d passed, %d failed\n' "$PASS" "$FAILED"
 [ "$FAILED" -eq 0 ]
