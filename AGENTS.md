@@ -129,6 +129,16 @@ Each of these exists because it broke something. Do not "simplify" one away.
 * **Only a fully successful swap kills the app-server.** On the rollback path the live
   auth is back on the account the app-server already serves, so a kill there would
   interrupt work to change nothing.
+* **In the urgent window, stay on the soonest-reset account.** While any account's
+  weekly reset is within `URGENT_LEAD_HOURS` and its weekly is under its own ceiling,
+  Trigger B is suppressed and Trigger U keeps (or returns) the pointer on that
+  account. Only 5h pressure (Trigger A) or its own ceiling (Trigger C) moves it off,
+  and Trigger U never targets a 5h-pressured account, or it and Trigger A would flap
+  every tick; it returns only once that account's 5h is back under `FIVE_HOUR_PCT`.
+  An unknown reset never makes an account urgent, and a Trigger U swap passes the
+  same in-flight gate as any other swap. On 2026-09-25, Trigger B moved the pointer
+  off an account roughly 21h from its weekly reset to rebalance divergence, stranding
+  that account's remaining weekly budget for the rest of its window.
 * **N=1 is a monitored no-op**, reached naturally through the normal decision path
   rather than by an early return.
 
@@ -152,3 +162,7 @@ When an external controller has its own drain ceiling, **keep it equal to this r
 `WEEKLY_CEIL_<label>` for the same account.** When the two diverge, a mid-drain account
 reads as exhausted to one system and as healthy to the other, and work gets routed away
 from accounts that still have budget.
+
+Likewise, when an external controller has its own urgency window for an expiring
+weekly allowance, **keep it equal to `URGENT_LEAD_HOURS`.** Otherwise one system
+treats an account as urgent and holds on it while the other rebalances away from it.

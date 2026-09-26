@@ -70,6 +70,11 @@ suite never touches the real `~/.claude`:
   control (the Claude mobile and desktop apps spend the same `seven_day` allowance, whether
   or not the CLI points at that account). Never set 100: consumers treat the ceiling as an
   admission check and nothing meters mid-job, so work admitted at 99 overruns and hard-fails
+- `URGENT_LEAD_HOURS=24`       an account whose known weekly reset is in the future and at
+  most this many hours away, with known weekly under its own ceiling, is URGENT: its
+  unspent allowance is about to expire. The soonest reset wins. Set 0 (or any non-positive
+  value) to disable. If an external controller has its own urgency window, keep it equal
+  to this value, the same as `WEEKLY_CEIL_<label>`
 - `ACCOUNTS="acctA acctB"`     space-separated labels; N accounts
 
 ## Usage endpoint (reuse this exact shape; see `reference/prototype`)
@@ -146,9 +151,22 @@ Default is the tick. `status` is a dry read-out: compute and print, never write 
    - No trigger may target a CAPPED account (known weekly `>= ` its own ceiling).
      Unknown weekly is NOT capped, matching the rule that an unread number never fires
      a trigger and never disqualifies an account.
-   - Precedence: A, then C, then B. A and C both say the active account is unusable, so
-     they outrank B, which only prefers between two usable accounts. Use weekly as a
-     tie-break among equal-headroom candidates.
+   - Trigger U (urgent): among accounts with a known weekly reset, known weekly under
+     their own ceiling, and not capped, the one whose reset falls strictly within
+     `URGENT_LEAD_HOURS` (soonest reset wins; ties keep `ACCOUNTS` order) is urgent.
+     While an urgent account exists, Trigger B is suppressed entirely, not retargeted:
+     rebalancing onto the lowest-weekly account would move work off the allowance that
+     expires first. Target = the urgent account, but only if it is not already ACTIVE,
+     has a valid stored credential, and its known 5h is not `>= FIVE_HOUR_PCT` (unknown
+     5h counts as not pressured). That exclusion is the same anti-flap guard as
+     Trigger B's: returning to a 5h-pressured urgent account would trip Trigger A on
+     the next tick and bounce straight back, so the pointer returns only once the
+     urgent account's 5h is back under threshold. An unknown or unparseable reset, or
+     unknown weekly, never makes an account urgent.
+   - Precedence: A, then C, then U, then B (B suppressed entirely while any account is
+     urgent). A and C both say the active account is unusable, so they outrank U and B;
+     U expresses an expiring-allowance preference that outranks B's ordinary
+     rebalancing preference. Use weekly as a tie-break among equal-headroom candidates.
    - Trigger C is NOT redundant with B. Divergence approximates a ceiling only by
      coincidence: when accounts sit near their respective ceilings the spread collapses
      below the dead zone, B goes quiet, and the pointer stays parked on the capped
@@ -156,7 +174,8 @@ Default is the tick. `status` is a dry read-out: compute and print, never write 
    - SHOULD_SWAP only if a valid target exists, `target != ACTIVE`, and
      `valid_cred(<target>.json)`.
 7. always emit one decision line: ACTIVE, every account's (5h, weekly), trigger
-   states, chosen target, decision. In `status` mode print to stdout and exit 0.
+   states including `trigU`, chosen target, decision. In `status` mode print to
+   stdout and exit 0.
 8. swap (SHOULD_SWAP and not DRY): swap in the token only, replacing the live
    `.claudeAiOauth` from `<target>.json` while preserving the live `.mcpOAuth`
    (read-modify-write, abort if invalid). On success set `active` = target and log
@@ -274,6 +293,29 @@ Use a temp `ROTATOR_STORE` and temp `ROTATOR_CRED` (fixtures), a stubbed
 - A symlink store is refused; the live cred fixture is byte-identical.
 - Refresh-token rotation is persisted: a rotated `refresh_token` in the response updates
   `<label>.json`'s refreshToken.
+- Urgent hold reproduces the 2026-09-25 replay: active weekly reset ~21h out and under
+  its ceiling, other account's spread would otherwise fire Trigger B; holds instead
+  and reports `trigU=0` (already on the urgent account).
+- Urgent target: a non-active account's reset inside the window with known weekly
+  under its ceiling fires Trigger U and swaps to it.
+- 5h pressure still moves off an urgent active account (Trigger A outranks U).
+- No return to an urgent account while it is 5h-pressured; returns once its 5h drops
+  back under `FIVE_HOUR_PCT`.
+- A capped account (weekly at or above its own ceiling) is never treated as urgent.
+- A `null`, unparseable/garbage, or empty `resets_at` is unknown, never urgent.
+- An in-flight-work gate (known or unknown) holds a Trigger U swap the same as any
+  other swap.
+- Outside the urgent window (reset further away than `URGENT_LEAD_HOURS`, or a reset
+  in the past), behavior is byte-identical to before the feature.
+- With multiple accounts inside the window, the soonest reset wins; a tie keeps
+  `ACCOUNTS` order.
+- A PIN outranks Trigger U the same as it outranks every other trigger.
+- The active account's reset is read via the mirror path exactly like its weekly.
+- N=1 with an urgent account is still a no-op.
+- A reset already in the past is not urgent.
+- Raising `URGENT_LEAD_HOURS` widens the window to include a reset that a smaller
+  default would have excluded.
+- `URGENT_LEAD_HOURS=0` disables the hold entirely, even with a reset moments away.
 Mock ONLY the external usage + token-refresh HTTP calls (and the clock if needed). Do
 NOT mock file ops.
 
