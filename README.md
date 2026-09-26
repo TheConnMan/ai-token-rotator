@@ -238,6 +238,9 @@ writing nothing). No need to stop the timer to pause.
 - `INTERVAL_MIN` (default 15): timer cadence in minutes.
 - `WEEKLY_CEIL_DEFAULT` (default 98) and per-account `WEEKLY_CEIL_<label>`: the weekly
   ceiling each account is held to. See "Per-account ceilings" below.
+- `URGENT_LEAD_HOURS` (default 24): an account whose known weekly reset is in the
+  future and at most this many hours away, with known weekly under its own ceiling,
+  is urgent. See "Decision rule" below. Set to 0 to disable.
 - `ACCOUNTS` (required): space-separated labels, one per bootstrapped account.
 
 ## Per-account ceilings
@@ -308,9 +311,18 @@ Utilization is on a 0-100 scale. On each tick:
   with the MINIMUM weekly utilization. The dead zone is `WEEKLY_DIVERGENCE_PCT` by
   default, tightening to 5 when the floor (min weekly) is at or above 80 and to 2.5
   when it is at or above 90.
-- Precedence is A, then C, then B. A and C both mean the active account is unusable,
-  so they outrank B, which only expresses a preference between two usable accounts.
-- A capped account is never a target, whichever trigger is choosing.
+- Trigger U (urgent): if an account's known weekly reset falls within
+  `URGENT_LEAD_HOURS` and its known weekly is under its own ceiling, it is urgent
+  (soonest reset wins on a tie among urgent accounts). While an urgent account
+  exists, Trigger B is suppressed entirely rather than retargeted. Swap to the
+  urgent account unless it is already ACTIVE, or its known 5h is at or above
+  `FIVE_HOUR_PCT` (the pointer returns to it only once that clears, avoiding a flap
+  with Trigger A).
+- Precedence is A, then C, then U, then B. A and C both mean the active account is
+  unusable, so they outrank U and B; U expresses a preference for protecting an
+  expiring allowance, which outranks B's ordinary rebalancing preference.
+- A capped account is never a target, whichever trigger is choosing, and is never
+  treated as urgent.
 
 Trigger C is not redundant with B. Divergence only approximates a ceiling by
 coincidence: when two accounts both sit near their respective ceilings the spread

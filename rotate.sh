@@ -29,6 +29,11 @@ source "$HERE/lib.sh"
 # The default is 98, the value the previous global pin-release threshold used, so an account
 # with no explicit ceiling behaves exactly as it did before ceilings existed.
 : "${WEEKLY_CEIL_DEFAULT:=98}"
+# Urgent window, in hours. An account whose KNOWN weekly reset is in the future and at most
+# this far away, and whose known weekly is under its own ceiling, is URGENT: its unspent
+# allowance is about to expire, so the pointer stays on (or returns to) it and Trigger B is
+# suppressed. The soonest reset wins. Not a positive number disables the hold.
+: "${URGENT_LEAD_HOURS:=24}"
 
 # Test hook: warn (stderr only, no store writes) when the usage mock is active so
 # a real run can never silently poll a mock instead of the real endpoint.
@@ -137,10 +142,11 @@ fi
 # Poll usage for every account. ACTIVE uses the live file's token (freshest);
 # every other account uses its stored token. Parallel maps: value = utilization
 # string, empty string = UNKNOWN. Unknown values never fire a trigger.
-declare -A FIVE WEEK
+declare -A FIVE WEEK RESET
 for label in "${ACCT_ARR[@]}"; do
     FIVE[$label]=""
     WEEK[$label]=""
+    RESET[$label]=""
     token=""
     refresh_attempted=0
     resp=""
@@ -196,6 +202,10 @@ for label in "${ACCT_ARR[@]}"; do
     if [ -n "$resp" ] && printf '%s' "$resp" | jq -e '.five_hour' >/dev/null 2>&1; then
         FIVE[$label]=$(maybe_usage_pct "$(printf '%s' "$resp" | jq -r '.five_hour.utilization // empty')")
         WEEK[$label]=$(maybe_usage_pct "$(printf '%s' "$resp" | jq -r '.seven_day.utilization // empty')")
+        # Weekly reset epoch from the SAME response as the weekly, so the two cannot come from
+        # different sources. For the active account on the mirror path this is the stored
+        # anchor that read_active_mirror just proved matches the mirror. Unparseable = unknown.
+        RESET[$label]=$(reset_epoch "$(printf '%s' "$resp" | jq -r '.seven_day.resets_at // empty')")
         [ "$DRY" -eq 0 ] && write_usage "$label" "$resp"
     fi
     # No stale-usage fallback: a failed poll leaves this account UNKNOWN (empty),
@@ -215,6 +225,11 @@ trigB=0
 targetB=""
 trigC=0
 targetC=""
+trigU=0
+targetU=""
+urgentLabel=""
+urgentEpoch=""
+urgentHours=""
 bestRoom=""
 target=""
 reason=""
@@ -365,15 +380,51 @@ if [ "$PIN_ACTIVE" -eq 0 ]; then
         [ -n "$targetC" ] && trigC=1
     fi
 
-    # Decide. A (a hard 5h stall) outranks C (a weekly reserve), which outranks B (a soft
-    # rebalance). A and C both describe the active account being unusable, so they come
-    # first; B only expresses a preference between two usable accounts.
+    # Trigger U (urgent): the account whose weekly reset is soonest inside URGENT_LEAD_HOURS,
+    # with a KNOWN weekly under its own ceiling, is about to lose its unspent allowance. While
+    # one exists, B is suppressed: rebalancing onto the lowest-weekly account would move work
+    # OFF the allowance that expires first. Unknown or unparseable resets and unknown weekly
+    # never make an account urgent. Ties on the reset keep ACCOUNTS order.
+    urgent_now=$(date +%s)
+    for label in "${ACCT_ARR[@]}"; do
+        e=${RESET[$label]:-}
+        [ -n "$e" ] || continue
+        [ -n "${WEEK[$label]:-}" ] || continue
+        capped "$label" && continue
+        left=$(( e - urgent_now ))
+        [ "$left" -gt 0 ] || continue
+        awk -v l="$left" -v h="$URGENT_LEAD_HOURS" 'BEGIN { exit (h > 0 && l <= h * 3600) ? 0 : 1 }' || continue
+        if [ -z "$urgentLabel" ] || [ "$e" -lt "$urgentEpoch" ]; then
+            urgentLabel=$label; urgentEpoch=$e
+        fi
+    done
+    if [ -n "$urgentLabel" ]; then
+        urgentHours=$(awk -v l="$(( urgentEpoch - urgent_now ))" 'BEGIN { printf "%.1f", l / 3600 }')
+        trigB=0
+        targetB=""
+        # Never return to an urgent account that is 5h-pressured: it would trip Trigger A on
+        # the next tick and bounce straight back, the same flap Trigger B's exclusion prevents.
+        # Unknown 5h counts as not pressured. The return happens once its 5h is under threshold.
+        if [ "$urgentLabel" != "$ACTIVE" ] && valid_cred "$STORE/$urgentLabel.json" \
+            && ! { [ -n "${FIVE[$urgentLabel]:-}" ] && num_ge "${FIVE[$urgentLabel]}" "$FIVE_HOUR_PCT"; }; then
+            trigU=1
+            targetU=$urgentLabel
+        fi
+    fi
+
+    # Decide. A (a hard 5h stall) outranks C (a weekly reserve), which outranks U (an expiring
+    # allowance), which outranks B (a soft rebalance). A and C both describe the active account
+    # being unusable, so they come first; B only expresses a preference between two usable
+    # accounts, and is suppressed entirely while an account is urgent.
     if [ "$trigA" -eq 1 ] && [ -n "$targetA" ]; then
         target=$targetA
         reason="5h pressure (active=${FIVE[$ACTIVE]} >= $FIVE_HOUR_PCT) -> $target"
     elif [ "$trigC" -eq 1 ] && [ -n "$targetC" ]; then
         target=$targetC
         reason="weekly ceiling (active=${WEEK[$ACTIVE]} >= ${CEIL[$ACTIVE]}) -> $target"
+    elif [ "$trigU" -eq 1 ] && [ -n "$targetU" ]; then
+        target=$targetU
+        reason="urgent account ($target weekly resets in ${urgentHours}h, wk=${WEEK[$target]} < ${CEIL[$target]}) -> $target"
     elif [ "$trigB" -eq 1 ] && [ -n "$targetB" ]; then
         target=$targetB
         reason="weekly divergence ($maxWeek-$minWeek >= $effZone) -> $target"
@@ -386,6 +437,7 @@ else
     trigA=0
     trigB=0
     trigC=0
+    trigU=0
     target=""
     for _pl in "${ACCT_ARR[@]}"; do
         [ "$_pl" = "$PIN_LABEL" ] && { target="$PIN_LABEL"; break; }
@@ -410,6 +462,12 @@ if [ "$SHOULD_SWAP" -eq 0 ]; then
         else
             reason="trigger fired but no valid target; holding on $ACTIVE"
         fi
+    elif [ -n "$urgentLabel" ] && [ "$urgentLabel" = "$ACTIVE" ]; then
+        reason="urgent hold: $ACTIVE weekly resets in ${urgentHours}h (wk=${WEEK[$ACTIVE]} < ${CEIL[$ACTIVE]}); staying, divergence suppressed"
+    elif [ -n "$urgentLabel" ] && [ -n "${FIVE[$urgentLabel]:-}" ] && num_ge "${FIVE[$urgentLabel]}" "$FIVE_HOUR_PCT"; then
+        reason="urgent $urgentLabel is 5h-pressured (5h=${FIVE[$urgentLabel]} >= $FIVE_HOUR_PCT); holding on $ACTIVE until it clears, divergence suppressed"
+    elif [ -n "$urgentLabel" ]; then
+        reason="urgent $urgentLabel has no valid stored credential; holding on $ACTIVE, divergence suppressed"
     elif [ -n "${WEEK[$ACTIVE]:-}" ] && capped "$ACTIVE"; then
         # The active account is over its ceiling and nothing else has room under its own.
         # Naming it beats "no trigger": every account is spent and the reserve is now being
@@ -453,7 +511,7 @@ done
 decision=HOLD
 [ "$SHOULD_SWAP" -eq 1 ] && decision=SWAP
 [ "$PIN_ACTIVE" -eq 1 ] && decision=PINNED
-line="active=$ACTIVE trigA=$trigA trigB=$trigB trigC=$trigC target=${target:-none} decision=$decision reason=$reason usages:$usages"
+line="active=$ACTIVE trigA=$trigA trigB=$trigB trigC=$trigC trigU=$trigU target=${target:-none} decision=$decision reason=$reason usages:$usages"
 
 if [ "$DRY" -eq 1 ]; then
     echo "status: $line"

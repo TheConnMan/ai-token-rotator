@@ -135,6 +135,21 @@ make_mock() {
 EOF
 }
 
+# iso_in_hours <h> - ISO reset timestamp <h> hours from now (h may be negative), in the
+# fractional-second offset form the real API returns, so tests are time independent.
+iso_in_hours() {
+    date -u -d "@$(( $(date +%s) + $1 * 3600 ))" '+%Y-%m-%dT%H:%M:%S.123456+00:00'
+}
+
+# make_mock_reset <mockdir> <token> <five_h> <weekly> <seven_day_resets_at_json> - make_mock
+# with an explicit weekly reset. Pass a JSON value: a quoted ISO string, null, or "garbage".
+make_mock_reset() {
+    local mockdir="$1" token="$2" five="$3" weekly="$4" reset="$5"
+    cat > "$mockdir/$token.json" <<EOF
+{"five_hour":{"utilization":$five,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":$weekly,"resets_at":$reset}}
+EOF
+}
+
 # make_mirror <path> <five_pct> <weekly_pct> <weekly_reset_epoch> [age_secs] - write
 # the statusline usage mirror (/tmp/claude-usage-starship.json shape). The rotator
 # only trusts it for the ACTIVE account when it is fresh AND its seven_day_reset
@@ -2019,6 +2034,370 @@ run_scenario "Ceiling: a capped account is never a target"      scenario_ceiling
 run_scenario "Ceiling: pin releases at the account ceiling"     scenario_ceiling_pin_releases_at_account_ceiling
 run_scenario "Ceiling: pin holds below the account ceiling"     scenario_ceiling_pin_holds_below_account_ceiling
 run_scenario "Ceiling: default applies to an unnamed account"   scenario_ceiling_default_applies_to_unnamed_account
+
+# --- Trigger U (urgent account hold) -----------------------------------------
+# An account whose KNOWN weekly reset is in the future and within URGENT_LEAD_HOURS
+# (default 24), with known weekly under its own ceiling, is urgent: its unspent allowance
+# is about to expire. The pointer stays on (or returns to) the soonest-reset urgent
+# account and Trigger B is suppressed. Resets are computed relative to now, so these
+# scenarios are time independent. Non-urgent accounts reset 150h out.
+
+# urgent_iso <h> - JSON string value for a reset <h> hours from now.
+urgent_iso() { printf '"%s"' "$(iso_in_hours "$1")"; }
+
+# urgent_base <accounts> <active> - config, seeded accounts, active pointer, ENABLED, live cred.
+urgent_base() {
+    local accounts="$1" active="$2" label
+    make_config "$CONFIG" "$accounts"
+    for label in $accounts; do
+        seed_account "$label" "tok-$label"
+    done
+    set_active "$active"
+    enable
+    make_cred "$CRED" "tok-$active"
+}
+
+# assert_out_has <substring> <msg> / assert_out_lacks - decision-line substring checks on $OUT.
+assert_out_has() {
+    case "$OUT" in
+        *"$1"*) ;;
+        *) fail "$2: expected '$1' in: $OUT" ;;
+    esac
+}
+assert_out_lacks() {
+    case "$OUT" in
+        *"$1"*) fail "$2: unexpected '$1' in: $OUT" ;;
+    esac
+}
+
+# U-a: replay of 2026-09-25. Active acctA at 57 of 99 with 21h to reset; acctB at 47 of
+# 95. Spread 10 at a dead zone of 10 used to rebalance onto acctB, moving work OFF the
+# allowance about to expire. Urgent hold keeps it on acctA with B suppressed.
+scenario_urgent_replay_holds_on_urgent_active() {
+    urgent_base "acctA acctB" acctA
+    set_ceilings "WEEKLY_DIVERGENCE_PCT=10" "WEEKLY_CEIL_acctA=99" "WEEKLY_CEIL_acctB=95"
+    make_mock_reset "$MOCK" "tok-acctA" 10 57 "$(urgent_iso 21)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 47 "$(urgent_iso 150)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent replay status exits 0"
+    assert_out_has "trigB=0" "urgent replay suppresses Trigger B"
+    assert_out_has "trigU=0" "urgent replay reports trigU=0 (already on the urgent account)"
+    assert_out_has "decision=HOLD" "urgent replay holds"
+    assert_out_has "urgent hold:" "urgent replay names the urgent hold"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent replay live exits 0"
+    assert_eq "acctA" "$(active_label)" "urgent replay stays on the urgent account"
+    assert_cred_token "$CRED" "tok-acctA" "urgent replay live cred is acctA"
+}
+
+# U-b: the urgent account is not active, so Trigger U moves the pointer to it, even though
+# it carries the higher weekly (B alone would never pick it).
+scenario_urgent_non_active_is_targeted() {
+    urgent_base "acctA acctB" acctA
+    make_mock_reset "$MOCK" "tok-acctA" 10 30 "$(urgent_iso 150)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 60 "$(urgent_iso 10)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent target status exits 0"
+    assert_out_has "trigU=1" "urgent target fires Trigger U"
+    assert_out_has "decision=SWAP" "urgent target decides SWAP"
+    assert_out_has "urgent account (" "urgent target reason names Trigger U"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent target live exits 0"
+    assert_eq "acctB" "$(active_label)" "urgent target moved the pointer to the urgent account"
+    assert_cred_token "$CRED" "tok-acctB" "urgent target live cred is acctB"
+}
+
+# U-c: an urgent ACTIVE account under 5h pressure still loses the pointer to Trigger A.
+scenario_urgent_active_5h_pressure_moves_off() {
+    urgent_base "acctA acctB" acctA
+    make_mock_reset "$MOCK" "tok-acctA" 85 50 "$(urgent_iso 10)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 40 "$(urgent_iso 150)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent 5h-pressure status exits 0"
+    assert_out_has "trigA=1" "urgent 5h-pressure fires Trigger A"
+    assert_out_has "trigU=0" "urgent 5h-pressure does not fire U on the active account"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent 5h-pressure live exits 0"
+    assert_eq "acctB" "$(active_label)" "Trigger A moved off the pressured urgent account"
+    assert_cred_token "$CRED" "tok-acctB" "urgent 5h-pressure live cred is acctB"
+}
+
+# U-d: after A moved off, U must not return to the urgent account while its 5h is still
+# pressured (A and U would flap every tick). Once its 5h clears, U returns.
+scenario_urgent_no_return_while_pressured_then_return() {
+    urgent_base "acctA acctB" acctB
+    make_mock_reset "$MOCK" "tok-acctB" 10 70 "$(urgent_iso 150)"
+    make_mock_reset "$MOCK" "tok-acctA" 85 40 "$(urgent_iso 10)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent no-return status exits 0"
+    assert_out_has "trigU=0" "urgent no-return does not fire U onto a pressured account"
+    assert_out_has "trigB=0" "urgent no-return keeps B suppressed"
+    assert_out_has "urgent acctA is 5h-pressured" "urgent no-return names the pressured urgent account"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent no-return tick1 exits 0"
+    assert_eq "acctB" "$(active_label)" "urgent no-return stays off the pressured urgent account"
+    assert_cred_token "$CRED" "tok-acctB" "urgent no-return tick1 live cred is acctB"
+
+    make_mock_reset "$MOCK" "tok-acctA" 20 40 "$(urgent_iso 10)"
+    run_rotate
+    assert_exit 0 "$RC" "urgent return tick2 exits 0"
+    assert_eq "acctA" "$(active_label)" "urgent return moved back once its 5h cleared"
+    assert_cred_token "$CRED" "tok-acctA" "urgent return live cred is acctA"
+}
+
+# U-e: an account at its own ceiling is never urgent, even with a reset 10h out.
+scenario_urgent_capped_account_is_not_urgent() {
+    urgent_base "acctA acctB acctC" acctA
+    set_ceilings "WEEKLY_CEIL_acctA=95" "WEEKLY_CEIL_acctB=98"
+    make_mock_reset "$MOCK" "tok-acctA" 10 96 "$(urgent_iso 150)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 99 "$(urgent_iso 10)"
+    make_mock_reset "$MOCK" "tok-acctC" 10 50 "$(urgent_iso 150)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent capped status exits 0"
+    assert_out_has "trigC=1" "urgent capped fires Trigger C"
+    assert_out_has "trigU=0" "urgent capped does not treat a capped account as urgent"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent capped live exits 0"
+    assert_eq "acctC" "$(active_label)" "urgent capped moved to the account with headroom"
+    assert_cred_token "$CRED" "tok-acctC" "urgent capped live cred is acctC"
+}
+
+# U-f: a null, unparseable, or empty reset is unknown and never urgent; B rebalances as today.
+urgent_unknown_reset_case() {
+    local reset="$1" tag="$2"
+    urgent_base "acctA acctB" acctA
+    make_mock_reset "$MOCK" "tok-acctA" 10 70 "$(urgent_iso 150)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 10 "$reset"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "$tag status exits 0"
+    assert_out_has "trigU=0" "$tag reset is never urgent"
+    assert_out_has "trigB=1" "$tag leaves Trigger B active"
+
+    run_rotate
+    assert_exit 0 "$RC" "$tag live exits 0"
+    assert_eq "acctB" "$(active_label)" "$tag rebalanced by Trigger B"
+    assert_cred_token "$CRED" "tok-acctB" "$tag live cred is acctB"
+}
+scenario_urgent_null_reset_is_unknown()        { urgent_unknown_reset_case 'null' "null-reset"; }
+scenario_urgent_garbage_reset_is_unknown()     { urgent_unknown_reset_case '"garbage"' "garbage-reset"; }
+scenario_urgent_empty_reset_is_unknown()       { urgent_unknown_reset_case '""' "empty-reset"; }
+
+# U-g: a Trigger U swap goes through the same in-flight gate: work in flight, or an
+# unanswerable probe, holds the pointer.
+urgent_inflight_case() {
+    local tag="$1"
+    make_mock_reset "$MOCK" "tok-acctA" 10 30 "$(urgent_iso 150)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 60 "$(urgent_iso 10)"
+    run_rotate
+    assert_exit 0 "$RC" "$tag exits 0"
+    # Without Trigger U nothing here would swap (acctA already has the lower weekly), so
+    # prove U chose acctB and only the in-flight gate held it.
+    local line
+    line=$(grep 'decision=' "$STORE/rotate.log" | tail -1)
+    case "$line" in
+        *"trigU=1 target=acctB decision=HOLD"*"flight"*) ;;
+        *) fail "$tag: expected Trigger U on acctB held by the in-flight gate, got: $line" ;;
+    esac
+    assert_eq "acctA" "$(active_label)" "$tag held the urgent swap"
+    assert_cred_token "$CRED" "tok-acctA" "$tag live cred still acctA"
+}
+scenario_urgent_inflight_work_holds() {
+    urgent_base "acctA acctB" acctA
+    set_inflight "job-1"
+    urgent_inflight_case "urgent in-flight work"
+}
+scenario_urgent_inflight_unknown_holds() {
+    urgent_base "acctA acctB" acctA
+    set_inflight "" 1
+    urgent_inflight_case "urgent in-flight unknown"
+}
+
+# U-h: a reset 30h out is outside the default 24h window; B rebalances as today.
+scenario_urgent_outside_window_unchanged() {
+    urgent_base "acctA acctB" acctA
+    make_mock_reset "$MOCK" "tok-acctA" 10 70 "$(urgent_iso 150)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 10 "$(urgent_iso 30)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent outside-window status exits 0"
+    assert_out_has "trigU=0" "urgent outside-window does not fire U"
+    assert_out_has "trigB=1" "urgent outside-window leaves Trigger B active"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent outside-window live exits 0"
+    assert_eq "acctB" "$(active_label)" "urgent outside-window rebalanced by Trigger B"
+    assert_cred_token "$CRED" "tok-acctB" "urgent outside-window live cred is acctB"
+}
+
+# U-i: with two urgent accounts, the soonest reset wins.
+scenario_urgent_soonest_reset_wins() {
+    urgent_base "acctA acctB acctC" acctA
+    make_mock_reset "$MOCK" "tok-acctA" 10 30 "$(urgent_iso 150)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 60 "$(urgent_iso 20)"
+    make_mock_reset "$MOCK" "tok-acctC" 10 60 "$(urgent_iso 5)"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent soonest exits 0"
+    assert_eq "acctC" "$(active_label)" "urgent soonest picked the soonest reset"
+    assert_cred_token "$CRED" "tok-acctC" "urgent soonest live cred is acctC"
+}
+
+# U-i2: identical resets keep ACCOUNTS order.
+scenario_urgent_tie_keeps_accounts_order() {
+    local same
+    same=$(urgent_iso 10)
+    urgent_base "acctA acctB acctC" acctA
+    make_mock_reset "$MOCK" "tok-acctA" 10 30 "$(urgent_iso 150)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 60 "$same"
+    make_mock_reset "$MOCK" "tok-acctC" 10 60 "$same"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent tie exits 0"
+    assert_eq "acctB" "$(active_label)" "urgent tie kept ACCOUNTS order"
+    assert_cred_token "$CRED" "tok-acctB" "urgent tie live cred is acctB"
+}
+
+# U-j: a PIN outranks urgency.
+scenario_urgent_pin_wins() {
+    urgent_base "acctA acctB" acctA
+    set_pin acctA
+    make_mock_reset "$MOCK" "tok-acctA" 10 30 "$(urgent_iso 150)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 60 "$(urgent_iso 10)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent pin status exits 0"
+    assert_out_has "decision=PINNED" "urgent pin reports PINNED"
+    assert_out_has "trigU=0" "urgent pin reports trigU=0"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent pin live exits 0"
+    assert_eq "acctA" "$(active_label)" "urgent pin kept the pinned account"
+    assert_cred_token "$CRED" "tok-acctA" "urgent pin live cred is acctA"
+}
+
+# U-k: the active account's reading comes from the reset-matched mirror. The urgent reset
+# is the stored anchor the mirror matched; the endpoint (5h=90) must not be consulted.
+scenario_urgent_via_mirror_path() {
+    local iso epoch
+    urgent_base "acctA acctB" acctA
+    iso=$(iso_in_hours 10)
+    epoch=$(date -d "$iso" +%s)
+    cat > "$STORE/acctA.usage.json" <<EOF
+{"five_hour":{"utilization":10,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":50,"resets_at":"$iso"},"captured_at":1700000000}
+EOF
+    make_mirror "$MIRROR_FILE" 10 50 "$epoch"
+    make_mock_reset "$MOCK" "tok-acctA" 90 50 "$(urgent_iso 10)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 20 "$(urgent_iso 150)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent mirror status exits 0"
+    assert_out_has "urgent hold:" "urgent mirror holds on the urgent active account"
+    assert_out_has "trigB=0" "urgent mirror suppresses Trigger B"
+    assert_out_has "trigA=0" "urgent mirror did not poll the endpoint's 5h=90"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent mirror live exits 0"
+    assert_eq "acctA" "$(active_label)" "urgent mirror stays on acctA"
+    assert_cred_token "$CRED" "tok-acctA" "urgent mirror live cred is acctA"
+}
+
+# U-l: N=1 with the only account urgent is still a monitored no-op.
+scenario_urgent_single_account_noop() {
+    urgent_base "acctA" acctA
+    make_mock_reset "$MOCK" "tok-acctA" 10 50 "$(urgent_iso 10)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent N=1 status exits 0"
+    assert_out_has "trigU=0" "urgent N=1 reports trigU=0"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent N=1 live exits 0"
+    assert_eq "acctA" "$(active_label)" "urgent N=1 keeps acctA"
+    assert_cred_token "$CRED" "tok-acctA" "urgent N=1 live cred is acctA"
+}
+
+# U-m: a reset already in the past is not urgent; acctA stays as the min-weekly account.
+scenario_urgent_past_reset_is_not_urgent() {
+    urgent_base "acctA acctB" acctA
+    make_mock_reset "$MOCK" "tok-acctA" 10 30 "$(urgent_iso 150)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 60 "$(urgent_iso -1)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent past-reset status exits 0"
+    assert_out_has "trigU=0" "urgent past-reset does not fire U"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent past-reset live exits 0"
+    assert_eq "acctA" "$(active_label)" "urgent past-reset stays on the min-weekly account"
+    assert_cred_token "$CRED" "tok-acctA" "urgent past-reset live cred is acctA"
+}
+
+# U-n1: URGENT_LEAD_HOURS=48 widens the window so a 30h reset is urgent.
+scenario_urgent_lead_override_widens_window() {
+    urgent_base "acctA acctB" acctA
+    set_ceilings "WEEKLY_DIVERGENCE_PCT=10" "WEEKLY_CEIL_acctA=99" "WEEKLY_CEIL_acctB=95" "URGENT_LEAD_HOURS=48"
+    make_mock_reset "$MOCK" "tok-acctA" 10 57 "$(urgent_iso 30)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 47 "$(urgent_iso 150)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent lead-override status exits 0"
+    assert_out_has "decision=HOLD" "urgent lead-override holds"
+    assert_out_has "urgent hold:" "urgent lead-override names the urgent hold"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent lead-override live exits 0"
+    assert_eq "acctA" "$(active_label)" "urgent lead-override stays on acctA"
+    assert_cred_token "$CRED" "tok-acctA" "urgent lead-override live cred is acctA"
+}
+
+# U-n2: URGENT_LEAD_HOURS=0 disables the hold; the replay rebalances as before.
+scenario_urgent_disabled_by_zero_lead() {
+    urgent_base "acctA acctB" acctA
+    set_ceilings "WEEKLY_DIVERGENCE_PCT=10" "WEEKLY_CEIL_acctA=99" "WEEKLY_CEIL_acctB=95" "URGENT_LEAD_HOURS=0"
+    make_mock_reset "$MOCK" "tok-acctA" 10 57 "$(urgent_iso 21)"
+    make_mock_reset "$MOCK" "tok-acctB" 10 47 "$(urgent_iso 150)"
+
+    run_rotate_status_out
+    assert_exit 0 "$RC" "urgent disabled status exits 0"
+    assert_out_has "trigU=0" "urgent disabled reports trigU=0"
+    assert_out_lacks "urgent hold:" "urgent disabled does not hold"
+
+    run_rotate
+    assert_exit 0 "$RC" "urgent disabled live exits 0"
+    assert_eq "acctB" "$(active_label)" "urgent disabled rebalanced by Trigger B"
+    assert_cred_token "$CRED" "tok-acctB" "urgent disabled live cred is acctB"
+}
+
+run_scenario "Urgent: 2026-09-25 replay holds on urgent active"  scenario_urgent_replay_holds_on_urgent_active
+run_scenario "Urgent: non-active urgent account is targeted"     scenario_urgent_non_active_is_targeted
+run_scenario "Urgent: 5h pressure still moves off urgent active" scenario_urgent_active_5h_pressure_moves_off
+run_scenario "Urgent: no return while pressured, then return"    scenario_urgent_no_return_while_pressured_then_return
+run_scenario "Urgent: a capped account is not urgent"            scenario_urgent_capped_account_is_not_urgent
+run_scenario "Urgent: null reset is unknown"                     scenario_urgent_null_reset_is_unknown
+run_scenario "Urgent: unparseable reset is unknown"              scenario_urgent_garbage_reset_is_unknown
+run_scenario "Urgent: empty reset is unknown"                    scenario_urgent_empty_reset_is_unknown
+run_scenario "Urgent: in-flight work holds the U swap"           scenario_urgent_inflight_work_holds
+run_scenario "Urgent: unknown in-flight holds the U swap"        scenario_urgent_inflight_unknown_holds
+run_scenario "Urgent: outside the window is unchanged"           scenario_urgent_outside_window_unchanged
+run_scenario "Urgent: soonest reset wins"                        scenario_urgent_soonest_reset_wins
+run_scenario "Urgent: tie keeps ACCOUNTS order"                  scenario_urgent_tie_keeps_accounts_order
+run_scenario "Urgent: PIN wins"                                  scenario_urgent_pin_wins
+run_scenario "Urgent: active reset via the mirror path"          scenario_urgent_via_mirror_path
+run_scenario "Urgent: N=1 is a no-op"                            scenario_urgent_single_account_noop
+run_scenario "Urgent: past reset is not urgent"                  scenario_urgent_past_reset_is_not_urgent
+run_scenario "Urgent: lead override widens the window"           scenario_urgent_lead_override_widens_window
+run_scenario "Urgent: zero lead disables the hold"               scenario_urgent_disabled_by_zero_lead
 
 # Live ticks must re-assert store 0700. A leftover 0777 directory is a TOCTOU
 # primitive for the predictable $STORE/*.tmp writers; chmod 700 closes it.
