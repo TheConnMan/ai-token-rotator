@@ -2201,6 +2201,14 @@ urgent_inflight_case() {
     make_mock_reset "$MOCK" "tok-acctB" 10 60 "$(urgent_iso 10)"
     run_rotate
     assert_exit 0 "$RC" "$tag exits 0"
+    # Without Trigger U nothing here would swap (acctA already has the lower weekly), so
+    # prove U chose acctB and only the in-flight gate held it.
+    local line
+    line=$(grep 'decision=' "$STORE/rotate.log" | tail -1)
+    case "$line" in
+        *"trigU=1 target=acctB decision=HOLD"*"flight"*) ;;
+        *) fail "$tag: expected Trigger U on acctB held by the in-flight gate, got: $line" ;;
+    esac
     assert_eq "acctA" "$(active_label)" "$tag held the urgent swap"
     assert_cred_token "$CRED" "tok-acctA" "$tag live cred still acctA"
 }
