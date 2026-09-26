@@ -152,8 +152,8 @@ Default is the tick. `status` is a dry read-out: compute and print, never write 
      Unknown weekly is NOT capped, matching the rule that an unread number never fires
      a trigger and never disqualifies an account.
    - Trigger U (urgent): among accounts with a known weekly reset, known weekly under
-     their own ceiling, and not capped, the one whose reset falls strictly within
-     `URGENT_LEAD_HOURS` (soonest reset wins; ties keep `ACCOUNTS` order) is urgent.
+     their own ceiling, and not capped, the one whose reset is at most
+     `URGENT_LEAD_HOURS` away (soonest reset wins; ties keep `ACCOUNTS` order) is urgent.
      While an urgent account exists, Trigger B is suppressed entirely, not retargeted:
      rebalancing onto the lowest-weekly account would move work off the allowance that
      expires first. Target = the urgent account, but only if it is not already ACTIVE,
