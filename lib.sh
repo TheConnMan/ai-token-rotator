@@ -110,6 +110,16 @@ maybe_usage_pct() {
     ' 2>/dev/null || true
 }
 
+# reset_epoch <iso> - echo the epoch seconds of an ISO-8601 reset timestamp, or nothing.
+# Only an explicit YYYY-MM-DDTHH:MM... string is accepted: GNU date parses "" as today's
+# midnight and accepts words like "tomorrow", and neither may ever read as a known reset.
+# Fractional seconds and offsets (2026-09-26T10:00:00.123456+00:00) parse as the API sends them.
+reset_epoch() {
+    local v="${1:-}"
+    [[ "$v" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2} ]] || return 0
+    date -d "$v" +%s 2>/dev/null || true
+}
+
 # read_active_mirror <active_label> - echo a fetch_usage-shaped usage response for
 # the ACTIVE account sourced from the statusline usage mirror, but ONLY when that
 # mirror is safe to trust; echo nothing otherwise (caller then polls the endpoint).
